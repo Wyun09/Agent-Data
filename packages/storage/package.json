@@ -1,0 +1,10 @@
+{
+  "name": "@agent-data/storage",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@agent-data/redaction": "0.1.0"
+  }
+}

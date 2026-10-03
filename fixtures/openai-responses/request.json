@@ -1,0 +1,11 @@
+{
+  "model": "gpt-5.6",
+  "stream": true,
+  "instructions": "You are a coding agent.",
+  "input": [
+    {"role": "user", "content": "Fix the failing test."}
+  ],
+  "tools": [
+    {"type": "function", "name": "shell", "description": "Run a command", "parameters": {"type": "object"}}
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@agent-data/proxy",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "type": "commonjs",
+  "dependencies": {
+    "@agent-data/core": "0.1.0",
+    "@agent-data/recorder": "0.1.0",
+    "@agent-data/storage": "0.1.0"
+  }
+}

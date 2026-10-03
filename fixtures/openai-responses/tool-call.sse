@@ -1,0 +1,12 @@
+event: response.created
+data: {"id":"resp_tool","status":"in_progress"}
+
+event: response.output_item.added
+data: {"item":{"id":"item_1","type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"cmd\":\"pwd\"}"}}
+
+event: response.function_call_arguments.delta
+data: {"item_id":"item_1","call_id":"call_1","name":"shell","delta":"{\"cmd\":\"pwd\"}"}
+
+event: response.completed
+data: {"id":"resp_tool","status":"completed"}
+

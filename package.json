@@ -1,0 +1,23 @@
+{
+  "name": "agent-session-data-factory",
+  "version": "0.1.0",
+  "description": "Local-first raw session recorder and transparent streaming proxy for AI agents.",
+  "private": true,
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "agent-data": "packages/cli/bin/agent-data.js"
+  },
+  "scripts": {
+    "prepare": "node scripts/bootstrap-packages.js",
+    "pretest": "node scripts/bootstrap-packages.js",
+    "prelint": "node scripts/bootstrap-packages.js",
+    "test": "node --test tests/*.test.js",
+    "lint": "node scripts/lint.js",
+    "check": "npm test && npm run lint",
+    "e2e:codex": "bash scripts/e2e-codex.sh"
+  },
+  "license": "MIT"
+}

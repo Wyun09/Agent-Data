@@ -1,0 +1,12 @@
+{
+  "agent_data": "0.1.0",
+  "schema": "1.0",
+  "agents": {
+    "codex": {"tested": ["0.160.0"]},
+    "claude-code": {"tested": []}
+  },
+  "protocols": {
+    "openai-responses": "v1",
+    "anthropic-messages": "planned-v0.2"
+  }
+}

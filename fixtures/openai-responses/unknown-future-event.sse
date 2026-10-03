@@ -1,0 +1,3 @@
+event: response.future_event.v2
+data: {"id":"future_1","opaque":{"value":true}}
+
