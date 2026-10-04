@@ -184,9 +184,13 @@ function normalizeRawRecords(records, options = {}) {
   const session = require('@agent-data/core').createSession({
     sessionId,
     startedAt: first?.recorded_at || records[0]?.recorded_at,
-    provider: { protocol: 'openai-responses' },
+    agent: first?.payload?.agent || {},
+    provider: first?.payload?.provider && typeof first.payload.provider === 'object'
+      ? first.payload.provider
+      : { protocol: 'openai-responses' },
+    environment: first?.payload?.environment || {},
     privacy: { mode: options.privacyMode || 'safe' },
-    metadata: { raw_records: records.length }
+    metadata: { raw_records: records.length, ...(first?.payload?.metadata || {}) }
   });
   const core = require('@agent-data/core');
   for (const record of records) {
@@ -216,6 +220,12 @@ function normalizeRawRecords(records, options = {}) {
       case 'client_disconnect':
         events = [createCanonicalEvent('error', { error: record.payload || {}, source: record.kind }, record.recorded_at)];
         break;
+      case 'verification_result':
+        events = [createCanonicalEvent('verification_result', { result: record.payload || {} }, record.recorded_at)];
+        break;
+      case 'reward_signal':
+        events = [createCanonicalEvent('reward_signal', { reward: record.payload || {} }, record.recorded_at)];
+        break;
       case 'session_end':
         events = [createCanonicalEvent('session_end', record.payload || {}, record.recorded_at)];
         break;
@@ -226,7 +236,10 @@ function normalizeRawRecords(records, options = {}) {
           data: record.payload
         }, record.recorded_at)];
     }
-    for (const event of events) core.applyCanonicalEvent(session, event);
+    for (const event of events) {
+      if (record.turn_id && !event.turn_id) event.turn_id = record.turn_id;
+      core.applyCanonicalEvent(session, event);
+    }
   }
   if (!session.ended_at && records.length) session.ended_at = records[records.length - 1].recorded_at;
   session.metadata.raw_records = records.length;

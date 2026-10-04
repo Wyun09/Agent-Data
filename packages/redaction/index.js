@@ -18,7 +18,8 @@ function isSensitiveHeader(name) {
 }
 
 function isSensitiveFieldName(name) {
-  return /^(authorization|proxy[_-]authorization|x[_-]api[_-]key|api[_-]?key|x[_-](?:auth|access)[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|secret|password|cookie|set[_-]cookie)$/i.test(String(name));
+  return /^(authorization|proxy[_-]authorization|x[_-]api[_-]key|api[_-]?key|x[_-](?:auth|access)[_-]?token|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|secret|password|cookie|set[_-]cookie)$/i.test(String(name))
+    || /(?:^|[_-])(?:api[_-]?key|access[_-]token|refresh[_-]token|id[_-]token|secret|password)$/i.test(String(name));
 }
 
 function redactHeaderValue(name, value) {
@@ -39,13 +40,17 @@ function redactHeaders(headers = {}) {
 function redactString(input, options = {}) {
   const mode = options.mode || 'safe';
   let value = String(input);
+  // SSE data and tool arguments can contain serialized credential fields.
+  if (/^\s*[\[{]/.test(value)) {
+    try { return JSON.stringify(redact(JSON.parse(value), options)); } catch { /* redact malformed text below */ }
+  }
 
   // Credential values are always removed, even in privacy mode "off".
   value = value.replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, REDACTED);
   value = value.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`);
   value = value.replace(/\b(?:sk-[A-Za-z0-9_-]{10,}|sk-ant-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{12,})\b/g, REDACTED);
   value = value.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, REDACTED);
-  value = value.replace(/(api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)\s*[:=]\s*(['"]?)[^\s,'"}&]+\2/gi, `$1=${REDACTED}`);
+  value = value.replace(/(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|client[_-]?secret|password)["']?\s*[:=]\s*(['"]?)[^\s,'"}&]+\2/gi, `$1=${REDACTED}`);
   value = value.replace(/(authorization\s*[:=]\s*)([^\s,;}]+)/gi, `$1${REDACTED}`);
 
   if (mode === 'strict') {

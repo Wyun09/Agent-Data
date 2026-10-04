@@ -75,11 +75,12 @@ function createCanonicalEvent(type, data = {}, timestamp = nowIso()) {
   };
 }
 
-function ensureTurn(session) {
+function ensureTurn(session, turnId) {
   if (!Array.isArray(session.turns)) session.turns = [];
-  if (!session.turns.length) {
+  let turn = turnId ? session.turns.find((item) => item.turn_id === turnId) : session.turns.at(-1);
+  if (!turn) {
     session.turns.push({
-      turn_id: id(),
+      turn_id: turnId || id(),
       request: { messages: [], tools: [], metadata: {} },
       response: { text: '', reasoning: '', status: null, error: null },
       tool_calls: [],
@@ -87,8 +88,8 @@ function ensureTurn(session) {
       usage: {},
       timing: {}
     });
+    turn = session.turns.at(-1);
   }
-  const turn = session.turns[session.turns.length - 1];
   turn.request ||= { messages: [], tools: [], metadata: {} };
   turn.response ||= { text: '', reasoning: '', status: null, error: null };
   turn.tool_calls ||= [];
@@ -104,21 +105,28 @@ function mergeToolCall(turn, call) {
     turn.tool_calls.push(call);
     return;
   }
-  const existing = turn.tool_calls.find((item) => (item.id || item.call_id || item.item_id) === key);
+  const existing = turn.tool_calls.find((item) => [item.id, item.call_id, item.item_id].includes(key)
+    || (call.item_id && [item.id, item.call_id, item.item_id].includes(call.item_id)));
   if (!existing) turn.tool_calls.push({ ...call, id: call.id || key });
-  else Object.assign(existing, call, {
-    arguments: call.arguments === undefined ? existing.arguments : call.arguments,
-    arguments_delta: call.arguments_delta === undefined ? existing.arguments_delta : call.arguments_delta
-  });
+  else {
+    const delta = `${existing.arguments_delta || ''}${call.arguments_delta || ''}`;
+    for (const [name, value] of Object.entries(call)) if (value !== undefined) existing[name] = value;
+    if (call.arguments_delta !== undefined) existing.arguments_delta = delta;
+  }
 }
 
 function applyCanonicalEvent(session, event) {
   if (!session.events) session.events = [];
   session.events.push(event);
-  const turn = ensureTurn(session);
+  const hasTurn = /^(request_|response_|tool_)/.test(event.type) || event.type === 'error';
+  const turn = hasTurn ? ensureTurn(session, event.turn_id) : null;
   switch (event.type) {
     case 'session_start':
       session.started_at ||= event.timestamp;
+      if (event.environment) session.environment = { ...session.environment, ...event.environment };
+      if (event.agent) session.agent = { ...session.agent, ...event.agent };
+      if (event.provider && typeof event.provider === 'object') session.provider = { ...session.provider, ...event.provider };
+      if (event.metadata && typeof event.metadata === 'object') session.metadata = { ...session.metadata, ...event.metadata };
       break;
     case 'session_end':
       session.ended_at = event.timestamp;
@@ -164,6 +172,8 @@ function applyCanonicalEvent(session, event) {
       turn.response.status = event.status || event.response?.status || turn.response.status;
       turn.response.id = event.response?.id || event.response_id || turn.response.id;
       turn.timing.response_end = event.timestamp;
+      if (event.latency_ms !== undefined) turn.timing.latency_ms = event.latency_ms;
+      if (event.time_to_first_token_ms !== undefined) turn.timing.time_to_first_token_ms = event.time_to_first_token_ms;
       if (event.usage) turn.usage = { ...turn.usage, ...event.usage };
       break;
     case 'error':
@@ -172,6 +182,10 @@ function applyCanonicalEvent(session, event) {
     case 'verification_result':
       session.verification ||= [];
       session.verification.push(event.result || event);
+      break;
+    case 'reward_signal':
+      session.reward ||= {};
+      session.reward = { ...session.reward, ...(event.reward || event.result || {}) };
       break;
     case 'label':
       session.labels ||= [];

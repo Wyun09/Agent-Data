@@ -1,0 +1,7 @@
+{
+  "name": "@agent-data/rewards",
+  "version": "0.2.0",
+  "private": true,
+  "main": "index.js",
+  "type": "commonjs"
+}

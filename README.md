@@ -1,13 +1,13 @@
 # Agent Session Data Factory
 
-Agent Session Data Factory v0.1.0 is a local-first recorder and transparent
+Agent Session Data Factory v0.2.0 is a local-first recorder and transparent
 HTTP/SSE proxy for agent sessions. It forwards requests to an upstream API,
 records sanitized raw protocol events as append-only JSONL, and creates a
 provider-independent canonical session that can be reprocessed later.
 
-The v0.1 release focuses on the OpenAI Responses API. Anthropic support,
-launchers, verification rewards, dataset exporters, and SQLite are reserved
-for later milestones.
+The v0.2 release adds a session launcher, Codex `login` authentication,
+environment capture, verification rewards, deterministic filtering, and SFT/RL
+JSONL exporters while preserving the raw replay source.
 
 ## Requirements
 
@@ -46,7 +46,8 @@ bash agent-data.sh demo
 ```
 
 也可以通过 `AGENT_DATA_UPSTREAM`、`AGENT_DATA_PORT`、`AGENT_DATA_DIR`
-覆盖默认值。
+覆盖默认值。`bash agent-data.sh codex ...` 默认复用 `codex login` 的账号会话，
+不会要求 `OPENAI_API_KEY`。只有显式使用 `--auth-mode api-key` 时才读取 API key。
 
 ```bash
 node packages/cli/bin/agent-data.js proxy \
@@ -77,6 +78,22 @@ x-agent-data-session-id: 6b4c2f80-...
 See [integrations/codex/README.md](integrations/codex/README.md) for a
 configuration that points Codex at the local proxy without changing Codex
 source code.
+
+## Capture a project run
+
+`run` 会把一次 Agent 运行中的多个请求串到同一个 session，并保存最小环境
+元数据。源码和完整 Git diff 不会自动写入数据目录。
+
+```bash
+node packages/cli/bin/agent-data.js run -- codex exec "Fix the failing test"
+node packages/cli/bin/agent-data.js verify --session <session-id> -- npm test
+node packages/cli/bin/agent-data.js filter
+node packages/cli/bin/agent-data.js export sft
+node packages/cli/bin/agent-data.js export rl
+```
+
+参考两个训练项目后形成的设计取舍见
+[docs/upgrade-v0.2.md](docs/upgrade-v0.2.md)。
 
 ## Inspect and reprocess
 
@@ -118,6 +135,11 @@ packages/proxy            HTTP forwarding and SSE passthrough
 packages/protocol-openai  Responses request/SSE adapter
 packages/redaction        disk-boundary secret redaction
 packages/cli              agent-data command line interface
+packages/environment      Git, runtime, and agent environment capture
+packages/verification     reproducible command verification records
+packages/rewards         deterministic reward signal aggregation
+packages/filters         quality filtering and trajectory deduplication
+packages/exporters       SFT/RL JSONL exporters with manifests
 ```
 
 Run the checks with:

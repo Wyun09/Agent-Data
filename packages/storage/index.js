@@ -4,6 +4,13 @@ const os = require('node:os');
 const path = require('node:path');
 const { redact } = require('@agent-data/redaction');
 
+function assertId(value, name = 'id') {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) || value === '.' || value === '..') {
+    throw new TypeError(`${name} must be 1-128 letters, digits, dots, underscores, or hyphens`);
+  }
+  return value;
+}
+
 function resolveDataDir(input) {
   return path.resolve(input || process.env.AGENT_DATA_HOME || path.join(os.homedir(), '.agent-data'));
 }
@@ -13,11 +20,11 @@ function datePart(timestamp = new Date().toISOString()) {
 }
 
 function rawPath(dataDir, sessionId, timestamp) {
-  return path.join(resolveDataDir(dataDir), 'raw', datePart(timestamp), `${sessionId}.jsonl`);
+  return path.join(resolveDataDir(dataDir), 'raw', datePart(timestamp), `${assertId(sessionId, 'session id')}.jsonl`);
 }
 
 function sessionPath(dataDir, sessionId) {
-  return path.join(resolveDataDir(dataDir), 'sessions', `${sessionId}.json`);
+  return path.join(resolveDataDir(dataDir), 'sessions', `${assertId(sessionId, 'session id')}.json`);
 }
 
 async function ensureDataDirs(dataDir) {
@@ -25,6 +32,8 @@ async function ensureDataDirs(dataDir) {
   await Promise.all([
     fsp.mkdir(path.join(root, 'raw'), { recursive: true }),
     fsp.mkdir(path.join(root, 'sessions'), { recursive: true }),
+    fsp.mkdir(path.join(root, 'contexts'), { recursive: true }),
+    fsp.mkdir(path.join(root, 'verification'), { recursive: true }),
     fsp.mkdir(path.join(root, 'datasets'), { recursive: true }),
     fsp.mkdir(path.join(root, 'logs'), { recursive: true }),
     fsp.mkdir(path.join(root, 'cache'), { recursive: true })
@@ -32,9 +41,44 @@ async function ensureDataDirs(dataDir) {
   return root;
 }
 
+function contextPath(dataDir, sessionId) {
+  return path.join(resolveDataDir(dataDir), 'contexts', `${assertId(sessionId, 'session id')}.json`);
+}
+
+function verificationPath(dataDir, verificationId) {
+  return path.join(resolveDataDir(dataDir), 'verification', `${assertId(verificationId, 'verification id')}.json`);
+}
+
+async function appendRawRecord(file, sessionId, kind, payload = {}, options = {}) {
+  const record = {
+    raw_schema_version: '1.0',
+    event_id: options.event_id || require('node:crypto').randomUUID(),
+    session_id: sessionId,
+    recorded_at: options.timestamp || new Date().toISOString(),
+    kind,
+    payload: redact(payload, { mode: options.privacyMode || 'safe' })
+  };
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  await fsp.appendFile(file, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+  return record;
+}
+
+async function findRawFile(dataDir, sessionId) {
+  const files = await listFilesRecursive(path.join(resolveDataDir(dataDir), 'raw'), '.jsonl');
+  for (const file of files) {
+    try {
+      const records = await readJsonl(file);
+      if (records.some((record) => record.session_id === sessionId)) return file;
+    } catch {
+      // A malformed raw file is handled by reprocess and should not hide other sessions.
+    }
+  }
+  return null;
+}
+
 async function writeJson(file, value, options = {}) {
   await fsp.mkdir(path.dirname(file), { recursive: true });
-  const contents = JSON.stringify(value, null, 2) + '\n';
+  const contents = JSON.stringify(redact(value, { mode: options.privacyMode || 'safe' }), null, 2) + '\n';
   const temporary = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   await fsp.writeFile(temporary, contents, { encoding: 'utf8', mode: options.mode || 0o600 });
   await fsp.rename(temporary, file);
@@ -108,6 +152,8 @@ class RawEventRecorder {
       session_id: this.sessionId,
       recorded_at: options.timestamp || new Date().toISOString(),
       kind,
+      ...(options.requestId ? { request_id: options.requestId } : {}),
+      ...(options.turnId ? { turn_id: options.turnId } : {}),
       payload: redact(payload, { mode: this.privacyMode })
     };
     const line = JSON.stringify(record) + '\n';
@@ -137,14 +183,19 @@ class RawEventRecorder {
 }
 
 module.exports = {
+  assertId,
   resolveDataDir,
   datePart,
   rawPath,
   sessionPath,
+  contextPath,
+  verificationPath,
   ensureDataDirs,
   writeJson,
   readJson,
   readJsonl,
   listFilesRecursive,
+  appendRawRecord,
+  findRawFile,
   RawEventRecorder
 };

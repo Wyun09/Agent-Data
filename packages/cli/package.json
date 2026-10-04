@@ -1,6 +1,6 @@
 {
   "name": "@agent-data/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "main": "index.js",
   "type": "commonjs",
@@ -8,6 +8,11 @@
     "@agent-data/proxy": "0.1.0",
     "@agent-data/protocol-openai": "0.1.0",
     "@agent-data/recorder": "0.1.0",
-    "@agent-data/storage": "0.1.0"
+    "@agent-data/storage": "0.1.0",
+    "@agent-data/environment": "0.2.0",
+    "@agent-data/verification": "0.2.0",
+    "@agent-data/rewards": "0.2.0",
+    "@agent-data/filters": "0.2.0",
+    "@agent-data/exporters": "0.2.0"
   }
 }

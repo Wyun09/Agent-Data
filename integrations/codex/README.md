@@ -20,19 +20,23 @@ model_provider = "agent_data_proxy"
 [model_providers.agent_data_proxy]
 name = "OpenAI through Agent Data Factory"
 base_url = "http://127.0.0.1:8787/v1"
-env_key = "OPENAI_API_KEY"
+requires_openai_auth = true
 wire_api = "responses"
 supports_websockets = false
 ```
+
+`requires_openai_auth = true` 让 Codex 使用当前 `codex login` 的账号认证。
+这里不需要复制 `~/.codex/auth.json`，也不需要设置 `OPENAI_API_KEY`。如果你确实
+要使用 API key，改成 `env_key = "OPENAI_API_KEY"`，并通过
+`--auth-mode api-key` 启动 launcher。
 
 The provider fields follow the Codex custom model provider configuration. The
 proxy's `--upstream` path and Codex's `base_url` should both include `/v1` when
 the upstream is an OpenAI-compatible HTTP API.
 
-Keep the existing Codex API key in Codex's own credential configuration. The
-proxy forwards the authentication header to the upstream but replaces its
-value before writing raw records. Do not put a key in a command line that is
-shared in shell history.
+The proxy forwards the authentication header to the upstream but replaces its
+value before writing raw records. It never reads or copies Codex's credential
+file. Do not put a key in a command line that is shared in shell history.
 
 A quick connectivity check can use the included mock upstream:
 
@@ -52,3 +56,7 @@ Codex version compatibility is tracked in [compatibility.json](compatibility.jso
 The v0.1 fixture suite has been validated against the Responses event shapes
 used by Codex CLI 0.160.x; a live model call requires the user's own provider
 credentials and network policy.
+
+For the recommended one-command flow, run `bash agent-data.sh codex ...` from
+the repository root. It creates a session context, starts an ephemeral local
+proxy, uses the logged-in Codex account, and closes the proxy after Codex exits.

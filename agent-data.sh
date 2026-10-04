@@ -18,7 +18,7 @@ Usage:
   bash agent-data.sh restart    Restart the background proxy
   bash agent-data.sh status     Show proxy status
   bash agent-data.sh logs       Follow proxy logs
-  bash agent-data.sh codex ...  Start the proxy, then run Codex
+  bash agent-data.sh codex ...  Record a Codex login session
   bash agent-data.sh demo       Run a local mock end-to-end request
 
 Environment overrides:
@@ -26,6 +26,7 @@ Environment overrides:
   AGENT_DATA_PORT       Proxy port (default: 8787)
   AGENT_DATA_HOST       Proxy host (default: 127.0.0.1)
   AGENT_DATA_DIR        Data directory (default: ./.agent-data)
+  AGENT_DATA_AUTH_MODE  codex-login (default) or api-key
 HELP
 }
 
@@ -105,18 +106,13 @@ status_proxy() {
 
 run_codex() {
   command -v codex >/dev/null 2>&1 || { printf '%s\n' 'codex command was not found.' >&2; exit 1; }
-  start_proxy
-  if test -z "${OPENAI_API_KEY:-}"; then
-    printf '%s\n' 'Warning: OPENAI_API_KEY is not set; Codex may use another configured credential.' >&2
-  fi
-  codex \
-    -c 'model_provider="agent_data_proxy"' \
-    -c 'model_providers.agent_data_proxy.name="Agent Data Proxy"' \
-    -c "model_providers.agent_data_proxy.base_url=\"http://$HOST:$PORT/v1\"" \
-    -c 'model_providers.agent_data_proxy.env_key="OPENAI_API_KEY"' \
-    -c 'model_providers.agent_data_proxy.wire_api="responses"' \
-    -c 'model_providers.agent_data_proxy.supports_websockets=false' \
-    "$@"
+  node "$CLI" run \
+    --upstream "$UPSTREAM" \
+    --host "$HOST" \
+    --port 0 \
+    --data-dir "$DATA_DIR" \
+    --auth-mode "${AGENT_DATA_AUTH_MODE:-codex-login}" \
+    -- codex "$@"
 }
 
 run_demo() {
@@ -127,9 +123,16 @@ run_demo() {
   fi
   demo_dir=$(mktemp -d "${TMPDIR:-/tmp}/agent-data-demo.XXXXXX")
   node "$CLI" mock-upstream --port 0 >"$demo_dir/mock.log" 2>&1 & demo_pid=$!
-  sleep 0.3
   local mock_port
-  mock_port=$(sed -n 's/.*127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$demo_dir/mock.log" | head -1)
+  mock_port=""
+  for _ in $(seq 1 50); do
+    mock_port=$(sed -n 's/.*127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' "$demo_dir/mock.log" | head -1)
+    test -n "$mock_port" && break
+    if ! kill -0 "$demo_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
   if test -z "$mock_port"; then
     printf '%s\n' 'Mock upstream failed to start.' >&2
     cat "$demo_dir/mock.log" >&2 || true

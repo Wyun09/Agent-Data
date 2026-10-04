@@ -1,268 +1,266 @@
+const fs = require('node:fs');
 const http = require('node:http');
 const https = require('node:https');
-const { URL } = require('node:url');
 const crypto = require('node:crypto');
-const { SSEParser: GenericSSEParser } = require('@agent-data/core/sse');
-const { RawEventRecorder } = require('@agent-data/recorder');
-const { finalizeRawSession } = require('@agent-data/recorder');
+const zlib = require('node:zlib');
+const { SSEParser } = require('@agent-data/core/sse');
+const { RawEventRecorder, finalizeRawSession } = require('@agent-data/recorder');
+const { assertId, contextPath, resolveDataDir } = require('@agent-data/storage');
 
 const HOP_BY_HOP = new Set([
-  'connection',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade'
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade'
 ]);
 
 function copyForwardHeaders(headers, target) {
   const result = {};
+  const excluded = String(headers.connection || '').toLowerCase().split(',').map((name) => name.trim());
   for (const [name, value] of Object.entries(headers || {})) {
     const lower = name.toLowerCase();
-    if (HOP_BY_HOP.has(lower) || lower === 'host' || lower === 'content-length' || lower === 'x-agent-data-session-id') continue;
+    if (HOP_BY_HOP.has(lower) || excluded.includes(lower) ||
+        ['host', 'content-length', 'x-agent-data-session-id'].includes(lower)) continue;
     result[name] = value;
   }
   result.host = target.host;
   return result;
 }
 
-function requestBodyValue(buffer, contentType) {
+function requestBodyValue(buffer, contentType = '') {
   const text = buffer.toString('utf8');
-  if (contentType && contentType.includes('json')) {
-    try { return JSON.parse(text); } catch { /* preserve text below */ }
+  if (contentType.includes('json')) {
+    try { return JSON.parse(text); } catch { /* preserve malformed text */ }
   }
   return text;
 }
 
 function makeTargetUrl(upstream, incomingUrl) {
   const base = new URL(upstream);
-  const requestUrl = new URL(incomingUrl || '/', 'http://agent-data.invalid');
-  const basePath = base.pathname.replace(/\/$/, '');
-  const requestPath = requestUrl.pathname;
-  if (!basePath || basePath === '/') base.pathname = requestPath;
-  else if (requestPath === basePath || requestPath.startsWith(`${basePath}/`)) base.pathname = requestPath;
-  else base.pathname = `${basePath}/${requestPath.replace(/^\/+/, '')}`;
-  base.search = requestUrl.search;
+  const request = new URL(incomingUrl || '/', 'http://agent-data.invalid');
+  const prefix = base.pathname.replace(/\/$/, '');
+  if (!prefix || prefix === '/' || request.pathname === prefix || request.pathname.startsWith(prefix + '/')) {
+    base.pathname = request.pathname;
+  } else base.pathname = prefix + '/' + request.pathname.replace(/^\/+/, '');
+  base.search = request.search;
   return base;
 }
 
 function responseHeaders(headers) {
-  const output = {};
-  for (const [name, value] of Object.entries(headers || {})) {
-    if (!HOP_BY_HOP.has(name.toLowerCase())) output[name] = value;
-  }
-  return output;
+  const excluded = String(headers.connection || '').toLowerCase().split(',').map((name) => name.trim());
+  return Object.fromEntries(Object.entries(headers).filter(([name]) =>
+    !HOP_BY_HOP.has(name.toLowerCase()) && !excluded.includes(name.toLowerCase())));
+}
+
+function readSessionContext(dataDir, sessionId) {
+  try { return JSON.parse(fs.readFileSync(contextPath(dataDir, sessionId), 'utf8')); } catch { return null; }
 }
 
 function createProxyServer(options = {}) {
   if (!options.upstream) throw new TypeError('upstream is required');
   const upstream = new URL(options.upstream);
-  const protocol = upstream.protocol === 'https:' ? https : http;
-  const dataDir = options.dataDir;
+  if (!['http:', 'https:'].includes(upstream.protocol)) throw new TypeError('upstream must use http or https');
+  const transport = upstream.protocol === 'https:' ? https : http;
+  const dataDir = resolveDataDir(options.dataDir);
   const privacyMode = options.privacyMode || 'safe';
   const provider = options.provider || 'openai-responses';
+  const states = new Map();
+  const pending = new Set();
+  const maxCapture = options.maxCaptureBytes || 8 * 1024 * 1024;
 
   const server = http.createServer((clientRequest, clientResponse) => {
-    const sessionId = String(clientRequest.headers['x-agent-data-session-id'] || crypto.randomUUID());
+    let sessionId;
+    try {
+      sessionId = assertId(String(clientRequest.headers['x-agent-data-session-id'] || options.defaultSessionId || crypto.randomUUID()), 'session id');
+    } catch {
+      clientResponse.writeHead(400, { 'content-type': 'application/json' });
+      clientResponse.end(JSON.stringify({ error: 'invalid_session_id' }));
+      clientRequest.resume();
+      return;
+    }
     const startedAt = new Date();
-    const recorder = new RawEventRecorder({ sessionId, dataDir, privacyMode, startedAt: startedAt.toISOString(), maxQueue: options.maxRecorderQueue, maxQueueBytes: options.maxRecorderQueueBytes });
-    const requestChunks = [];
-    let requestEnded = false;
-    let responseStarted = false;
+    const requestId = crypto.randomUUID();
+    let state = states.get(sessionId);
+    if (!state) {
+      const context = readSessionContext(dataDir, sessionId);
+      const recorder = new RawEventRecorder({
+        sessionId, dataDir, privacyMode, startedAt: context?.created_at || startedAt.toISOString(),
+        maxQueue: options.maxRecorderQueue, maxQueueBytes: options.maxRecorderQueueBytes
+      });
+      state = { recorder, tail: Promise.resolve(), active: 0 };
+      states.set(sessionId, state);
+      void recorder.record('session_start', {
+        session_id: sessionId, provider,
+        agent: context?.agent || null, environment: context?.environment || {},
+        metadata: context?.metadata || {}, privacy_mode: privacyMode
+      }, { timestamp: startedAt.toISOString() });
+    }
+    state.active += 1;
+    const { recorder } = state;
+    const record = (kind, payload = {}) => recorder.record(kind, payload, { requestId, turnId: requestId });
+    void record('http_request_start', { method: clientRequest.method, url: clientRequest.url });
+    clientResponse.setHeader('x-agent-data-session-id', sessionId);
+    let finalized = false;
     let responseEnded = false;
     let clientClosed = false;
     let upstreamRequest;
-    let upstreamResponse;
-    let responseParser;
-    let firstTokenAt;
-    let responseContentType = '';
-    let finalized = false;
+    let firstByteAt;
 
-    clientResponse.setHeader('x-agent-data-session-id', sessionId);
-    void recorder.record('session_start', {
-      session_id: sessionId,
-      method: clientRequest.method,
-      url: clientRequest.url,
-      provider,
-      client: { user_agent: clientRequest.headers['user-agent'] || null }
-    }, { timestamp: startedAt.toISOString() });
-
-    const finish = async (kind, payload = {}) => {
+    const finish = (kind, payload = {}) => {
       if (finalized) return;
       finalized = true;
-      await recorder.record(kind, payload);
-      await recorder.record('session_end', {
-        ended: true,
-        recording_incomplete: recorder.incomplete,
-        provider
+      state.active -= 1;
+      void record(kind, payload);
+      void recorder.record('session_end', {
+        recording_incomplete: recorder.incomplete, open_requests: state.active
       });
-      await recorder.flush();
-      try {
+      state.tail = state.tail.then(async () => {
+        await recorder.flush();
         await finalizeRawSession({ dataDir, file: recorder.file, sessionId, privacyMode, normalizer: options.normalizer });
-      } catch (error) {
-        process.emitWarning(`agent-data canonicalization: ${error.message}`);
-      }
+      }).catch((error) => process.emitWarning('agent-data canonicalization: ' + error.message));
+      const task = state.tail;
+      pending.add(task);
+      void task.finally(() => pending.delete(task));
     };
-
-    const abortUpstream = () => {
-      if (upstreamRequest && !upstreamRequest.destroyed) upstreamRequest.destroy();
-    };
-
-    clientRequest.on('aborted', () => {
+    const cancel = () => {
       clientClosed = true;
-      abortUpstream();
-      void finish('client_disconnect', { phase: 'request', message: 'client aborted request' });
-    });
-    clientResponse.on('close', () => {
-      if (!responseEnded && !clientResponse.writableEnded) {
-        clientClosed = true;
-        abortUpstream();
-        void finish('client_disconnect', { phase: 'response', message: 'client closed response' });
-      }
-    });
+      finish('client_disconnect', { message: 'client disconnected' });
+      upstreamRequest?.destroy();
+    };
+    clientRequest.on('aborted', cancel);
+    clientRequest.on('error', cancel);
+    clientResponse.on('close', () => { if (!responseEnded) cancel(); });
 
-    let target;
-    try {
-      target = makeTargetUrl(options.upstream, clientRequest.url);
-    } catch (error) {
-      void recorder.record('proxy_error', { code: 'invalid_target', message: error.message });
-      clientResponse.statusCode = 500;
-      clientResponse.end('invalid upstream target');
-      void finish('proxy_error', { code: 'invalid_target', message: error.message });
-      return;
-    }
-
-    const requestOptions = {
-      protocol: target.protocol,
+    const target = makeTargetUrl(options.upstream, clientRequest.url);
+    upstreamRequest = transport.request({
       hostname: target.hostname,
       port: target.port || (target.protocol === 'https:' ? 443 : 80),
-      method: clientRequest.method,
-      path: `${target.pathname}${target.search}`,
+      path: target.pathname + target.search, method: clientRequest.method,
       headers: copyForwardHeaders(clientRequest.headers, target),
-      timeout: options.timeoutMs || 0,
       rejectUnauthorized: options.rejectUnauthorized
-    };
-
-    upstreamRequest = protocol.request(requestOptions, (upstreamRes) => {
-      upstreamResponse = upstreamRes;
-      responseStarted = true;
-      responseContentType = String(upstreamRes.headers['content-type'] || '');
-      const responseStartAt = new Date();
-      clientResponse.statusCode = upstreamRes.statusCode || 502;
-      for (const [name, value] of Object.entries(responseHeaders(upstreamRes.headers))) {
-        try { clientResponse.setHeader(name, value); } catch { /* invalid upstream header */ }
-      }
-      clientResponse.setHeader('x-agent-data-session-id', sessionId);
-      clientResponse.flushHeaders?.();
-      void recorder.record('response_start', {
-        status_code: upstreamRes.statusCode,
-        headers: upstreamRes.headers,
-        content_type: responseContentType
-      }, { timestamp: responseStartAt.toISOString() });
-
-      if (responseContentType.toLowerCase().includes('text/event-stream')) {
-        const Parser = options.sseParser || GenericSSEParser;
-        responseParser = new Parser();
-      }
-      upstreamRes.on('data', (chunk) => {
-        if (!firstTokenAt) firstTokenAt = new Date();
-        if (!clientResponse.writableEnded && !clientClosed) clientResponse.write(chunk);
-        if (responseParser) {
-          const events = responseParser.feed(chunk);
-          for (const event of events) void recorder.record('sse_event', event);
+    }, (upstreamResponse) => {
+      const contentType = String(upstreamResponse.headers['content-type'] || '');
+      const encoding = String(upstreamResponse.headers['content-encoding'] || '').toLowerCase();
+      const statusCode = upstreamResponse.statusCode || 502;
+      clientResponse.writeHead(statusCode, { ...responseHeaders(upstreamResponse.headers), 'x-agent-data-session-id': sessionId });
+      clientResponse.flushHeaders();
+      void record('response_start', { status_code: statusCode, headers: upstreamResponse.headers, content_type: contentType });
+      const parser = contentType.includes('text/event-stream') ? new (options.sseParser || SSEParser)() : null;
+      let captured = 0;
+      let body = [];
+      let decoder;
+      const decodedData = (chunk) => {
+        if (parser) {
+          for (const event of parser.feed(chunk)) void record('sse_event', event);
+        } else if (captured + chunk.length <= maxCapture) {
+          body.push(Buffer.from(chunk));
+          captured += chunk.length;
         } else {
-          void recorder.record('response_chunk', { encoding: 'base64', data: Buffer.from(chunk).toString('base64') });
+          body = [];
+          captured = maxCapture + 1;
+          recorder.incomplete = true;
         }
-      });
-      upstreamRes.on('end', () => {
-        if (responseParser) {
-          for (const event of responseParser.finish()) void recorder.record('sse_event', event);
+      };
+      const decodedEnd = () => {
+        if (parser) {
+          for (const event of parser.finish()) void record('sse_event', event);
+        } else if (captured <= maxCapture && /json|text/.test(contentType)) {
+          void record('response_body', { body: requestBodyValue(Buffer.concat(body), contentType), status_code: statusCode });
+        } else {
+          void record('response_body_omitted', { reason: captured > maxCapture ? 'capture_limit' : 'binary_content', content_type: contentType });
         }
-        responseEnded = true;
-        if (!clientResponse.writableEnded) clientResponse.end();
         const endedAt = new Date();
-        void finish('response_end', {
-          status_code: upstreamRes.statusCode,
-          latency_ms: endedAt - startedAt,
-          time_to_first_token_ms: firstTokenAt ? firstTokenAt - startedAt : null,
-          content_type: responseContentType,
-          provider
+        finish('response_end', {
+          status_code: statusCode, latency_ms: endedAt - startedAt,
+          time_to_first_token_ms: firstByteAt ? firstByteAt - startedAt : null,
+          content_type: contentType
         });
-      });
-      upstreamRes.on('aborted', () => {
-        void finish('upstream_error', { code: 'upstream_response_aborted', status_code: upstreamRes.statusCode });
-        if (!clientResponse.writableEnded) clientResponse.end();
-      });
-      upstreamRes.on('error', (error) => {
-        void finish('upstream_error', { code: error.code || 'upstream_response_error', message: error.message });
-        if (!clientResponse.writableEnded) clientResponse.end();
-      });
-    });
-
-    if (requestOptions.timeout) {
-      upstreamRequest.setTimeout(requestOptions.timeout, () => {
-        upstreamRequest.destroy(new Error('upstream timeout'));
-      });
-    }
-    upstreamRequest.on('error', (error) => {
-      void recorder.record('upstream_error', { code: error.code || 'upstream_error', message: error.message });
-      if (!clientResponse.headersSent) {
-        clientResponse.statusCode = error.code === 'ECONNRESET' ? 502 : 502;
-        clientResponse.setHeader('content-type', 'application/json');
-        clientResponse.end(JSON.stringify({ error: 'upstream_error', message: error.message }));
-      } else if (!clientResponse.writableEnded) {
-        clientResponse.end();
+      };
+      if (encoding === 'gzip') decoder = zlib.createGunzip();
+      else if (encoding === 'deflate') decoder = zlib.createInflate();
+      else if (encoding === 'br') decoder = zlib.createBrotliDecompress();
+      else if (encoding && encoding !== 'identity') {
+        recorder.incomplete = true;
+        void record('capture_error', { code: 'unsupported_encoding', encoding });
       }
-      if (!responseEnded) {
+      if (decoder) {
+        decoder.on('data', decodedData);
+        decoder.on('end', decodedEnd);
+        decoder.on('error', (error) => {
+          recorder.incomplete = true;
+          finish('capture_error', { message: error.message });
+        });
+      }
+      upstreamResponse.on('data', (chunk) => {
+        firstByteAt ||= new Date();
+        if (!clientClosed && !clientResponse.write(chunk)) upstreamResponse.pause();
+        if (decoder) decoder.write(chunk);
+        else if (!encoding || encoding === 'identity') decodedData(chunk);
+      });
+      clientResponse.on('drain', () => upstreamResponse.resume());
+      upstreamResponse.on('end', () => {
         responseEnded = true;
-        void finish('upstream_error', { code: error.code || 'upstream_error', message: error.message });
-      }
-    });
-
-    clientRequest.on('data', (chunk) => {
-      requestChunks.push(Buffer.from(chunk));
-      upstreamRequest.write(chunk);
-    });
-    clientRequest.on('end', () => {
-      requestEnded = true;
-      const requestBuffer = Buffer.concat(requestChunks);
-      void recorder.record('request', {
-        method: clientRequest.method,
-        url: clientRequest.url,
-        headers: clientRequest.headers,
-        body_text: requestBuffer.toString('utf8'),
-        body: requestBodyValue(requestBuffer, clientRequest.headers['content-type']),
-        provider
+        if (!clientClosed) clientResponse.end();
+        if (decoder) decoder.end();
+        else decodedEnd();
       });
-      upstreamRequest.end();
+      const failure = (error) => {
+        finish('upstream_error', { code: error?.code || 'upstream_response_aborted', message: error?.message });
+        responseEnded = true;
+        if (!clientClosed) clientResponse.end();
+        decoder?.destroy();
+      };
+      upstreamResponse.on('aborted', failure);
+      upstreamResponse.on('error', failure);
     });
-    clientRequest.on('error', (error) => {
-      void recorder.record('proxy_error', { phase: 'client_request', code: error.code, message: error.message });
-      abortUpstream();
+    if (options.timeoutMs) upstreamRequest.setTimeout(options.timeoutMs, () =>
+      upstreamRequest.destroy(Object.assign(new Error('upstream timeout'), { code: 'ETIMEDOUT' })));
+    upstreamRequest.on('error', (error) => {
+      finish('upstream_error', { code: error.code, message: error.message });
+      responseEnded = true;
+      if (clientClosed) return;
+      if (!clientResponse.headersSent) {
+        clientResponse.writeHead(502, { 'content-type': 'application/json' });
+        clientResponse.end(JSON.stringify({ error: 'upstream_error', message: error.message }));
+      } else clientResponse.end();
     });
-  });
 
-  server.on('close', () => {
-    // Requests own their recorder lifecycle. This hook exists for embedders to observe closure.
+    const requestChunks = [];
+    let requestBytes = 0;
+    clientRequest.on('data', (chunk) => {
+      requestBytes += chunk.length;
+      if (requestBytes <= maxCapture) requestChunks.push(Buffer.from(chunk));
+      else { requestChunks.length = 0; recorder.incomplete = true; }
+      if (!upstreamRequest.destroyed && !upstreamRequest.write(chunk)) clientRequest.pause();
+    });
+    upstreamRequest.on('drain', () => clientRequest.resume());
+    clientRequest.on('end', () => {
+      void record('request', {
+        method: clientRequest.method, url: clientRequest.url, headers: clientRequest.headers,
+        body: requestBytes <= maxCapture ? requestBodyValue(Buffer.concat(requestChunks), String(clientRequest.headers['content-type'] || '')) : null,
+        capture_incomplete: requestBytes > maxCapture, provider
+      });
+      if (!upstreamRequest.destroyed) upstreamRequest.end();
+    });
   });
-  server.agentData = { upstream: options.upstream, dataDir, privacyMode, provider };
+  server.agentData = {
+    upstream: options.upstream, dataDir, privacyMode, provider,
+    drain: async () => {
+      await Promise.all([...pending]);
+      await Promise.all([...states.values()].map((state) => state.recorder.flush()));
+    }
+  };
   return server;
 }
 
 async function listenProxy(options = {}) {
   const server = createProxyServer(options);
-  const host = options.host || '127.0.0.1';
-  const port = options.port === undefined ? 8787 : Number(options.port);
   await new Promise((resolve, reject) => {
-    const onError = (error) => { server.off('listening', onListening); reject(error); };
-    const onListening = () => { server.off('error', onError); resolve(); };
-    server.once('error', onError);
-    server.once('listening', onListening);
-    server.listen(port, host);
+    server.once('error', reject);
+    server.listen(options.port === undefined ? 8787 : Number(options.port), options.host || '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
   });
   return server;
 }
 
-module.exports = { createProxyServer, listenProxy, makeTargetUrl, copyForwardHeaders };
+module.exports = { createProxyServer, listenProxy, makeTargetUrl, copyForwardHeaders, readSessionContext };
