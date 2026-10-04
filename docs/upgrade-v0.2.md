@@ -35,13 +35,13 @@ Codex login session
 ```bash
 cd /storage/emulated/0/Agent
 npm install
-bash agent-data.sh demo
-bash agent-data.sh codex exec "Fix the failing test"
-# 终端输出会给出 session id
-node packages/cli/bin/agent-data.js verify --data-dir .agent-data --session <id> -- npm test
-node packages/cli/bin/agent-data.js filter --data-dir .agent-data
-node packages/cli/bin/agent-data.js export sft --data-dir .agent-data
-node packages/cli/bin/agent-data.js export rl --data-dir .agent-data
+bash agent-data.sh start
+# 另开一个终端，直接使用已经指向本地 Provider 的 Codex
+codex
 ```
+
+代理会自动记录所有请求，生成 `.agent-data/datasets/auto/` 下的 SFT/RL 文件。
+需要实时查看请求计数时，在第一个终端使用 `bash agent-data.sh ui`；单次任务也可以
+用 `bash agent-data.sh task "Fix the failing test"` 完成运行、验证和导出。
 
 `PLAN.md` 仍是本地计划文件，不提交到 GitHub。训练项目目录只是被记录为运行环境的 Git 仓库信息，不会自动上传源码、完整 diff、环境变量或凭据。

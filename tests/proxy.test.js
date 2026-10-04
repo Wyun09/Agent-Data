@@ -150,3 +150,39 @@ test('client cancellation is recorded without crashing the proxy', async (t) => 
   const session = await readJson(files[0]);
   assert.ok(session.events.some((event) => event.type === 'error'));
 });
+
+test('automatic proxy mode groups requests and runs the finalization hook', async (t) => {
+  const dataDir = await tempDir();
+  const upstream = http.createServer((request, response) => {
+    request.resume();
+    request.on('end', () => {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end([
+        'event: response.created\ndata: {"id":"auto-response","status":"in_progress"}\n\n',
+        'event: response.output_text.delta\ndata: {"response_id":"auto-response","delta":"captured"}\n\n',
+        'event: response.completed\ndata: {"id":"auto-response","status":"completed"}\n\n'
+      ].join(''));
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => upstream.close());
+  const hookFile = path.join(dataDir, 'hook.json');
+  const proxy = await listenProxy({
+    upstream: `http://127.0.0.1:${upstream.address().port}`,
+    port: 0,
+    dataDir,
+    defaultSessionId: 'automatic-session',
+    onSessionFinalized: async ({ session }) => fsp.writeFile(hookFile, JSON.stringify(session))
+  });
+  t.after(() => proxy.close());
+  const response = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/responses`, {
+    method: 'POST', body: JSON.stringify({ model: 'mock', stream: true })
+  });
+  await response.text();
+  const session = JSON.parse(await waitFor(hookFile));
+  assert.equal(session.session_id, 'automatic-session');
+  assert.equal(proxy.agentData.stats.sessions, 1);
+  assert.equal(proxy.agentData.stats.requests, 1);
+  assert.equal(proxy.agentData.stats.responses, 1);
+  assert.match(session.turns[0].response.text, /captured/);
+});

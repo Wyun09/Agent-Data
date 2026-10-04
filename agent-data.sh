@@ -18,7 +18,9 @@ Usage:
   bash agent-data.sh restart    Restart the background proxy
   bash agent-data.sh status     Show proxy status
   bash agent-data.sh logs       Follow proxy logs
+  bash agent-data.sh ui         Start the live proxy dashboard
   bash agent-data.sh codex ...  Record a Codex login session
+  bash agent-data.sh task "..."  Run, verify, filter, and export in one step
   bash agent-data.sh demo       Run a local mock end-to-end request
 
 Environment overrides:
@@ -27,6 +29,8 @@ Environment overrides:
   AGENT_DATA_HOST       Proxy host (default: 127.0.0.1)
   AGENT_DATA_DIR        Data directory (default: ./.agent-data)
   AGENT_DATA_AUTH_MODE  codex-login (default) or api-key
+  AGENT_DATA_AUTO_VERIFY auto (default), 0 to skip, or a custom command below
+  AGENT_DATA_VERIFY_COMMAND  Verification command, for example: npm test
 HELP
 }
 
@@ -52,6 +56,7 @@ start_proxy() {
     --host "$current_host" \
     --port "$current_port" \
     --data-dir "$DATA_DIR" \
+    --auto-export \
     >"$LOG_FILE" 2>&1 &
   local pid=$!
   printf '%s\n' "$pid" >"$PID_FILE"
@@ -104,15 +109,90 @@ status_proxy() {
   fi
 }
 
+new_session_id() {
+  node -e "process.stdout.write(require('node:crypto').randomUUID())"
+}
+
+postprocess_session() {
+  local session_id=$1
+  local verify_status=0
+  local auto_verify=${AGENT_DATA_AUTO_VERIFY:-auto}
+  local -a verify_command=()
+
+  if test -n "${AGENT_DATA_VERIFY_COMMAND:-}"; then
+    read -r -a verify_command <<<"$AGENT_DATA_VERIFY_COMMAND"
+  elif test "$auto_verify" != '0'; then
+    if test -f package.json && node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)" >/dev/null 2>&1; then
+      verify_command=(npm test)
+    elif { test -f pyproject.toml || test -f pytest.ini || test -f setup.cfg; } && command -v pytest >/dev/null 2>&1; then
+      verify_command=(pytest -q)
+    elif test -f Cargo.toml && command -v cargo >/dev/null 2>&1; then
+      verify_command=(cargo test)
+    elif test -f go.mod && command -v go >/dev/null 2>&1; then
+      verify_command=(go test ./...)
+    fi
+  fi
+
+  if test "${#verify_command[@]}" -gt 0; then
+    printf '%s\n' "自动验证: ${verify_command[*]}"
+    if node "$CLI" verify --data-dir "$DATA_DIR" --session "$session_id" -- "${verify_command[@]}"; then
+      :
+    else
+      verify_status=$?
+    fi
+  fi
+
+  node "$CLI" filter --data-dir "$DATA_DIR" >/dev/null 2>&1 || true
+  if test -f "$DATA_DIR/sessions/$session_id.json"; then
+    node "$CLI" export sft --data-dir "$DATA_DIR" --session "$session_id" >/dev/null 2>&1 || true
+    node "$CLI" export rl --data-dir "$DATA_DIR" --session "$session_id" >/dev/null 2>&1 || true
+    printf '%s\n' "已生成 SFT/RL 数据: $DATA_DIR/datasets"
+  else
+    printf '%s\n' "未发现可导出的 Session 文件: $session_id" >&2
+  fi
+  return "$verify_status"
+}
+
 run_codex() {
   command -v codex >/dev/null 2>&1 || { printf '%s\n' 'codex command was not found.' >&2; exit 1; }
-  node "$CLI" run \
+  local session_id status=0
+  session_id=$(new_session_id)
+  if node "$CLI" run \
     --upstream "$UPSTREAM" \
     --host "$HOST" \
     --port 0 \
     --data-dir "$DATA_DIR" \
     --auth-mode "${AGENT_DATA_AUTH_MODE:-codex-login}" \
+    --session-id "$session_id" \
     -- codex "$@"
+  then
+    status=0
+  else
+    status=$?
+  fi
+  local post_status=0
+  if postprocess_session "$session_id"; then
+    :
+  else
+    post_status=$?
+  fi
+  if test "$status" -eq 0 && test "$post_status" -ne 0; then
+    status=$post_status
+  fi
+  return "$status"
+}
+
+run_task() {
+  test "$#" -gt 0 || { printf '%s\n' 'task requires a prompt.' >&2; return 2; }
+  run_codex exec "$*"
+}
+
+run_ui() {
+  node "$CLI" start \
+    --upstream "$UPSTREAM" \
+    --host "$HOST" \
+    --port "$PORT" \
+    --data-dir "$DATA_DIR"
 }
 
 run_demo() {
@@ -161,7 +241,9 @@ case "$command" in
   restart) stop_proxy; start_proxy ;;
   status) status_proxy ;;
   logs) mkdir -p "$DATA_DIR"; touch "$LOG_FILE"; tail -f "$LOG_FILE" ;;
+  ui) run_ui ;;
   codex) run_codex "$@" ;;
+  task) run_task "$@" ;;
   demo) run_demo ;;
   help|--help|-h) usage ;;
   *) usage; exit 2 ;;

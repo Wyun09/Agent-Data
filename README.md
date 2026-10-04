@@ -32,11 +32,30 @@ bash agent-data.sh logs
 bash agent-data.sh stop
 ```
 
-它默认连接 `https://api.openai.com/v1`，并把数据写入项目下的
-`.agent-data/`。要直接启动一个经过代理的 Codex 新会话：
+`start` 会在后台启动代理，并自动把每个会话写成
+`.agent-data/datasets/auto/` 下的 SFT/RL 数据。要查看实时计数器，可以使用：
 
 ```bash
-bash agent-data.sh codex exec "Say hello"
+bash agent-data.sh ui
+```
+
+完成一次 Codex Provider 配置后，日常流程只有两步。先在一个终端启动代理：
+
+```bash
+bash agent-data.sh start
+```
+
+再开一个终端直接运行 Codex：
+
+```bash
+codex
+```
+
+所有经过 `http://127.0.0.1:8787/v1` 的对话都会自动记录、脱敏、归档并生成训练数据。
+如果只想一条命令完成一次 Codex 任务，也可以使用：
+
+```bash
+bash agent-data.sh task "Fix the failing test"
 ```
 
 首次验证可以运行：

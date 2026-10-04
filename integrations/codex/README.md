@@ -57,6 +57,10 @@ The v0.1 fixture suite has been validated against the Responses event shapes
 used by Codex CLI 0.160.x; a live model call requires the user's own provider
 credentials and network policy.
 
-For the recommended one-command flow, run `bash agent-data.sh codex ...` from
-the repository root. It creates a session context, starts an ephemeral local
-proxy, uses the logged-in Codex account, and closes the proxy after Codex exits.
+For the automatic background flow, run `bash agent-data.sh start` in one
+terminal, then open another terminal and run `codex`. The proxy groups requests
+without an explicit session header, continuously writes sanitized raw records,
+and refreshes aggregate SFT/RL files under `.agent-data/datasets/auto/`.
+Use `bash agent-data.sh ui` when you want a live counter dashboard. For a
+single captured task, `bash agent-data.sh task "Fix the failing test"` runs the
+Codex command and post-processes its session automatically.

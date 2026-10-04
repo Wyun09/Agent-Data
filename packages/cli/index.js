@@ -47,29 +47,85 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  process.stdout.write(`Agent Session Data Factory ${VERSION}\n\nUsage:\n  agent-data proxy --upstream <url> [options]\n  agent-data run [options] -- <agent command> [args...]\n  agent-data verify [options] -- <command> [args...]\n  agent-data sessions [--data-dir <dir>]\n  agent-data show <session-id> [--data-dir <dir>]\n  agent-data reprocess [--all|--session <id>] [--data-dir <dir>]\n  agent-data filter [--data-dir <dir>]\n  agent-data export sft|rl [options]\n  agent-data doctor [--data-dir <dir>]\n  agent-data config [--data-dir <dir>]\n  agent-data mock-upstream [--port <port>]\n  agent-data version\n\nProxy options:\n  --upstream URL       Upstream API origin (required)\n  --port PORT          Listen port (default 8787)\n  --host HOST          Listen host (default 127.0.0.1)\n  --data-dir DIR       Data directory (default ~/.agent-data)\n  --privacy-mode MODE  safe, strict, or off (default safe)\n  --provider NAME      Protocol adapter (default openai-responses)\n\nRun options:\n  --upstream URL       Upstream API origin (default https://api.openai.com/v1)\n  --auth-mode MODE     codex-login (default) or api-key\n  --session-id ID      Correlate all requests from the child process\n\nExport options:\n  --output FILE        JSONL destination (default data-dir/datasets)\n  --session ID         Export one session\n  --include-failed     Keep sessions with failed verification\n  --include-trivial    Keep short/no-tool trajectories\n`);
+  process.stdout.write(`Agent Session Data Factory ${VERSION}\n\nUsage:\n  agent-data proxy --upstream <url> [options]\n  agent-data start --upstream <url> [options]\n  agent-data run [options] -- <agent command> [args...]\n  agent-data verify [options] -- <command> [args...]\n  agent-data sessions [--data-dir <dir>]\n  agent-data show <session-id> [--data-dir <dir>]\n  agent-data reprocess [--all|--session <id>] [--data-dir <dir>]\n  agent-data filter [--data-dir <dir>]\n  agent-data export sft|rl [options]\n  agent-data doctor [--data-dir <dir>]\n  agent-data config [--data-dir <dir>]\n  agent-data mock-upstream [--port <port>]\n  agent-data version\n\nProxy options:\n  --upstream URL       Upstream API origin (required)\n  --port PORT          Listen port (default 8787)\n  --host HOST          Listen host (default 127.0.0.1)\n  --data-dir DIR       Data directory (default ~/.agent-data)\n  --privacy-mode MODE  safe, strict, or off (default safe)\n  --provider NAME      Protocol adapter (default openai-responses)\n  --auto-export        continuously write per-session SFT/RL datasets\n  --dashboard          show live request/session counters\n\nRun options:\n  --upstream URL       Upstream API origin (default https://api.openai.com/v1)\n  --auth-mode MODE     codex-login (default) or api-key\n  --session-id ID      Correlate all requests from the child process\n\nExport options:\n  --output FILE        JSONL destination (default data-dir/datasets)\n  --session ID         Export one session\n  --include-failed     Keep sessions with failed verification\n  --include-trivial    Keep short/no-tool trajectories\n`);
+}
+
+function enabledOption(value) {
+  return value === true || value === '' || String(value).toLowerCase() === 'true';
+}
+
+async function autoExportSession(dataDir, privacyMode) {
+  const outputDir = path.join(dataDir, 'datasets', 'auto');
+  await exportDataset({
+    dataDir,
+    type: 'sft',
+    output: path.join(outputDir, 'sft.jsonl'),
+    include_errors: true,
+    include_failed: true,
+    include_trivial: true,
+    privacyMode
+  });
+  await exportDataset({
+    dataDir,
+    type: 'rl',
+    output: path.join(outputDir, 'rl.jsonl'),
+    include_errors: true,
+    include_failed: true,
+    include_trivial: true,
+    privacyMode
+  });
 }
 
 async function commandProxy(options) {
   if (!options.upstream) throw new Error('--upstream is required for proxy');
   const host = options.host || '127.0.0.1';
+  const dataDir = resolveDataDir(options.data_dir);
+  const privacyMode = options.privacy_mode || 'safe';
+  const autoExport = enabledOption(options.auto_export);
+  let autoExportTail = Promise.resolve();
   const server = await listenProxy({
     upstream: options.upstream,
     port: options.port === undefined ? 8787 : Number(options.port),
     host,
-    dataDir: options.data_dir,
-    privacyMode: options.privacy_mode || 'safe',
+    dataDir,
+    defaultSessionId: options.default_session_id || (autoExport ? crypto.randomUUID() : undefined),
+    privacyMode,
     provider: options.provider || 'openai-responses',
     normalizer: normalizeRawRecords,
-    timeoutMs: options.timeout_ms ? Number(options.timeout_ms) : 0
+    timeoutMs: options.timeout_ms ? Number(options.timeout_ms) : 0,
+    onSessionFinalized: autoExport
+      ? (finalized) => {
+        autoExportTail = autoExportTail.then(() => autoExportSession(dataDir, privacyMode));
+        return autoExportTail;
+      }
+      : undefined
   });
   const address = server.address();
   process.stdout.write(`agent-data proxy listening on http://${host}:${address.port}; upstream ${options.upstream}\n`);
+  if (autoExport) process.stdout.write(`auto datasets: ${path.join(dataDir, 'datasets', 'auto')}\n`);
   if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
     process.stderr.write('warning: proxy is listening on a non-loopback interface\n');
   }
+  let dashboardTimer;
+  if (enabledOption(options.dashboard)) {
+    dashboardTimer = setInterval(() => {
+      const stats = server.agentData.stats;
+      process.stdout.write(`\r[agent-data] sessions=${stats.sessions} requests=${stats.requests} responses=${stats.responses} events=${stats.captured_events} last=${stats.last_activity || '-'}   `);
+    }, 1000);
+    dashboardTimer.unref?.();
+  }
   await new Promise((resolve) => {
-    const close = () => server.close(() => resolve());
+    let closing = false;
+    const close = () => {
+      if (closing) return;
+      closing = true;
+      if (dashboardTimer) clearInterval(dashboardTimer);
+      server.close(async () => {
+        await server.agentData.drain?.();
+        if (dashboardTimer) process.stdout.write('\n');
+        resolve();
+      });
+    };
     process.once('SIGINT', close);
     process.once('SIGTERM', close);
   });
@@ -310,6 +366,7 @@ async function main(argv = process.argv.slice(2)) {
   const command = positional[0] || 'help';
   switch (command) {
     case 'proxy': return commandProxy(options);
+    case 'start': return commandProxy({ ...options, auto_export: true, dashboard: true });
     case 'run': return commandRun(options);
     case 'verify': return commandVerify(options);
     case 'filter': return commandFilter(options);

@@ -65,6 +65,14 @@ function createProxyServer(options = {}) {
   const states = new Map();
   const pending = new Set();
   const maxCapture = options.maxCaptureBytes || 8 * 1024 * 1024;
+  const stats = {
+    started_at: new Date().toISOString(),
+    requests: 0,
+    responses: 0,
+    sessions: 0,
+    captured_events: 0,
+    last_activity: null
+  };
 
   const server = http.createServer((clientRequest, clientResponse) => {
     let sessionId;
@@ -78,6 +86,8 @@ function createProxyServer(options = {}) {
     }
     const startedAt = new Date();
     const requestId = crypto.randomUUID();
+    stats.requests += 1;
+    stats.last_activity = startedAt.toISOString();
     let state = states.get(sessionId);
     if (!state) {
       const context = readSessionContext(dataDir, sessionId);
@@ -87,6 +97,7 @@ function createProxyServer(options = {}) {
       });
       state = { recorder, tail: Promise.resolve(), active: 0 };
       states.set(sessionId, state);
+      stats.sessions += 1;
       void recorder.record('session_start', {
         session_id: sessionId, provider,
         agent: context?.agent || null, environment: context?.environment || {},
@@ -114,7 +125,8 @@ function createProxyServer(options = {}) {
       });
       state.tail = state.tail.then(async () => {
         await recorder.flush();
-        await finalizeRawSession({ dataDir, file: recorder.file, sessionId, privacyMode, normalizer: options.normalizer });
+        const finalizedSession = await finalizeRawSession({ dataDir, file: recorder.file, sessionId, privacyMode, normalizer: options.normalizer });
+        if (options.onSessionFinalized) await options.onSessionFinalized(finalizedSession);
       }).catch((error) => process.emitWarning('agent-data canonicalization: ' + error.message));
       const task = state.tail;
       pending.add(task);
@@ -149,7 +161,10 @@ function createProxyServer(options = {}) {
       let decoder;
       const decodedData = (chunk) => {
         if (parser) {
-          for (const event of parser.feed(chunk)) void record('sse_event', event);
+          for (const event of parser.feed(chunk)) {
+            stats.captured_events += 1;
+            void record('sse_event', event);
+          }
         } else if (captured + chunk.length <= maxCapture) {
           body.push(Buffer.from(chunk));
           captured += chunk.length;
@@ -161,7 +176,10 @@ function createProxyServer(options = {}) {
       };
       const decodedEnd = () => {
         if (parser) {
-          for (const event of parser.finish()) void record('sse_event', event);
+          for (const event of parser.finish()) {
+            stats.captured_events += 1;
+            void record('sse_event', event);
+          }
         } else if (captured <= maxCapture && /json|text/.test(contentType)) {
           void record('response_body', { body: requestBodyValue(Buffer.concat(body), contentType), status_code: statusCode });
         } else {
@@ -198,6 +216,8 @@ function createProxyServer(options = {}) {
       clientResponse.on('drain', () => upstreamResponse.resume());
       upstreamResponse.on('end', () => {
         responseEnded = true;
+        stats.responses += 1;
+        stats.last_activity = new Date().toISOString();
         if (!clientClosed) clientResponse.end();
         if (decoder) decoder.end();
         else decodedEnd();
@@ -242,7 +262,7 @@ function createProxyServer(options = {}) {
     });
   });
   server.agentData = {
-    upstream: options.upstream, dataDir, privacyMode, provider,
+    upstream: options.upstream, dataDir, privacyMode, provider, stats,
     drain: async () => {
       await Promise.all([...pending]);
       await Promise.all([...states.values()].map((state) => state.recorder.flush()));
