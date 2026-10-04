@@ -85,11 +85,11 @@ source code.
 元数据。源码和完整 Git diff 不会自动写入数据目录。
 
 ```bash
-node packages/cli/bin/agent-data.js run -- codex exec "Fix the failing test"
-node packages/cli/bin/agent-data.js verify --session <session-id> -- npm test
-node packages/cli/bin/agent-data.js filter
-node packages/cli/bin/agent-data.js export sft
-node packages/cli/bin/agent-data.js export rl
+node packages/cli/bin/agent-data.js run --data-dir .agent-data -- codex exec "Fix the failing test"
+node packages/cli/bin/agent-data.js verify --data-dir .agent-data --session <session-id> -- npm test
+node packages/cli/bin/agent-data.js filter --data-dir .agent-data
+node packages/cli/bin/agent-data.js export sft --data-dir .agent-data
+node packages/cli/bin/agent-data.js export rl --data-dir .agent-data
 ```
 
 参考两个训练项目后形成的设计取舍见

@@ -38,10 +38,10 @@ npm install
 bash agent-data.sh demo
 bash agent-data.sh codex exec "Fix the failing test"
 # 终端输出会给出 session id
-node packages/cli/bin/agent-data.js verify --session <id> -- npm test
-node packages/cli/bin/agent-data.js filter
-node packages/cli/bin/agent-data.js export sft
-node packages/cli/bin/agent-data.js export rl
+node packages/cli/bin/agent-data.js verify --data-dir .agent-data --session <id> -- npm test
+node packages/cli/bin/agent-data.js filter --data-dir .agent-data
+node packages/cli/bin/agent-data.js export sft --data-dir .agent-data
+node packages/cli/bin/agent-data.js export rl --data-dir .agent-data
 ```
 
 `PLAN.md` 仍是本地计划文件，不提交到 GitHub。训练项目目录只是被记录为运行环境的 Git 仓库信息，不会自动上传源码、完整 diff、环境变量或凭据。
