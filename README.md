@@ -39,7 +39,14 @@ bash agent-data.sh stop
 bash agent-data.sh ui
 ```
 
-完成一次 Codex Provider 配置后，日常流程只有两步。先在一个终端启动代理：
+首次在这个设备上执行一次配置：
+
+```bash
+bash agent-data.sh setup-codex
+```
+
+它会备份 `~/.codex/config.toml`，设置本地 Provider，并保留当前 `codex login` 登录态。
+之后日常流程只有两步。先在一个终端启动代理：
 
 ```bash
 bash agent-data.sh start

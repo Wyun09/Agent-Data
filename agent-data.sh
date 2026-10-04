@@ -19,6 +19,7 @@ Usage:
   bash agent-data.sh status     Show proxy status
   bash agent-data.sh logs       Follow proxy logs
   bash agent-data.sh ui         Start the live proxy dashboard
+  bash agent-data.sh setup-codex Point Codex at the local proxy (one time)
   bash agent-data.sh codex ...  Record a Codex login session
   bash agent-data.sh task "..."  Run, verify, filter, and export in one step
   bash agent-data.sh demo       Run a local mock end-to-end request
@@ -195,6 +196,27 @@ run_ui() {
     --data-dir "$DATA_DIR"
 }
 
+setup_codex() {
+  local codex_home=${CODEX_HOME:-"$HOME/.codex"}
+  local config="$codex_home/config.toml"
+  local backup=''
+  mkdir -p "$codex_home"
+  if test -f "$config"; then
+    backup="$config.agent-data.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$config" "$backup"
+  fi
+  node "$ROOT_DIR/scripts/setup-codex.js" "$config"
+  if command -v codex >/dev/null 2>&1; then
+    if codex --version >/dev/null 2>&1; then
+      printf '%s\n' 'Codex configuration is valid.'
+    else
+      printf '%s\n' 'Codex configuration was written; run codex doctor if it reports a config error.' >&2
+    fi
+  fi
+  printf '%s\n' "Codex now uses http://127.0.0.1:8787/v1 when the proxy is running."
+  test -z "$backup" || printf '%s\n' "Backup: $backup"
+}
+
 run_demo() {
   local demo_dir demo_pid
   if pid_is_running; then
@@ -242,6 +264,7 @@ case "$command" in
   status) status_proxy ;;
   logs) mkdir -p "$DATA_DIR"; touch "$LOG_FILE"; tail -f "$LOG_FILE" ;;
   ui) run_ui ;;
+  setup-codex) setup_codex ;;
   codex) run_codex "$@" ;;
   task) run_task "$@" ;;
   demo) run_demo ;;

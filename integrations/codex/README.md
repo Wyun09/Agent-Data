@@ -57,7 +57,10 @@ The v0.1 fixture suite has been validated against the Responses event shapes
 used by Codex CLI 0.160.x; a live model call requires the user's own provider
 credentials and network policy.
 
-For the automatic background flow, run `bash agent-data.sh start` in one
+For one-time setup, run `bash agent-data.sh setup-codex`; it backs up the
+existing `~/.codex/config.toml` and points the default Codex provider at the
+local proxy while preserving the current `codex login` session. For the
+automatic background flow, run `bash agent-data.sh start` in one
 terminal, then open another terminal and run `codex`. The proxy groups requests
 without an explicit session header, continuously writes sanitized raw records,
 and refreshes aggregate SFT/RL files under `.agent-data/datasets/auto/`.

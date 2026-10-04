@@ -35,6 +35,7 @@ Codex login session
 ```bash
 cd /storage/emulated/0/Agent
 npm install
+bash agent-data.sh setup-codex  # 只需执行一次
 bash agent-data.sh start
 # 另开一个终端，直接使用已经指向本地 Provider 的 Codex
 codex
