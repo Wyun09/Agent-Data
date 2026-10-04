@@ -6,7 +6,7 @@ the configuration mechanism supported by the installed Codex version.
 
 ```bash
 node packages/cli/bin/agent-data.js proxy \
-  --upstream https://api.openai.com/v1 \
+  --upstream https://chatgpt.com/backend-api/codex \
   --port 8787 \
   --data-dir ~/.agent-data
 ```
@@ -30,13 +30,28 @@ supports_websockets = false
 要使用 API key，改成 `env_key = "OPENAI_API_KEY"`，并通过
 `--auth-mode api-key` 启动 launcher。
 
-The provider fields follow the Codex custom model provider configuration. The
-proxy's `--upstream` path and Codex's `base_url` should both include `/v1` when
-the upstream is an OpenAI-compatible HTTP API.
+Codex's local `base_url` includes `/v1`. The default upstream for ChatGPT login
+is `https://chatgpt.com/backend-api/codex`, matching the installed Codex client;
+the proxy maps local `/v1/responses` to `/backend-api/codex/responses`. API-key
+mode instead defaults to `https://api.openai.com/v1`. Keep an explicit relay
+URL when using a third-party provider.
+
+For a relay that only exposes Chat Completions, start the proxy with
+`--protocol-bridge responses-to-chat` (or set
+`AGENT_DATA_PROTOCOL_BRIDGE=responses-to-chat`). The proxy sends the translated
+request to `/v1/chat/completions`, converts text/tool-call SSE events back to
+Responses events, and keeps the original Responses request in the raw record.
 
 The proxy forwards the authentication header to the upstream but replaces its
 value before writing raw records. It never reads or copies Codex's credential
 file. Do not put a key in a command line that is shared in shell history.
+
+`GET /v1/models` is forwarded directly without creating a recorded session.
+The original authorization, status code, body, and request ID are preserved.
+A forwarded 401/403 with `Missing scopes` still indicates an upstream credential
+or endpoint mismatch; transparent forwarding cannot grant missing scopes.
+ChatGPT subscription access and API-key access are distinct authentication
+methods ([official authentication guide](https://learn.chatgpt.com/docs/auth)).
 
 A quick connectivity check can use the included mock upstream:
 

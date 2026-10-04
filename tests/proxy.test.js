@@ -5,7 +5,7 @@ const fsp = fs.promises;
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { listenProxy } = require('@agent-data/proxy');
+const { listenProxy, copyForwardHeaders, makeTargetUrl } = require('@agent-data/proxy');
 const { listFilesRecursive, readJson } = require('@agent-data/storage');
 
 async function tempDir() {
@@ -19,6 +19,78 @@ async function waitFor(file, timeout = 3000) {
   }
   throw new Error(`timed out waiting for ${file}`);
 }
+
+test('header forwarding always preserves Authorization', () => {
+  const headers = copyForwardHeaders({
+    authorization: 'Bearer login-token',
+    connection: 'authorization, keep-alive',
+    'x-agent-data-session-id': 'header-session',
+    'content-length': '12'
+  }, new URL('https://upstream.example/v1'));
+  assert.equal(headers.authorization, 'Bearer login-token');
+  assert.equal(headers.host, 'upstream.example');
+  assert.equal(headers.connection, undefined);
+  assert.equal(headers['x-agent-data-session-id'], undefined);
+  assert.equal(headers['content-length'], undefined);
+});
+
+test('ChatGPT login backend strips local /v1 but keeps API-key paths', () => {
+  assert.equal(makeTargetUrl('https://chatgpt.com/backend-api/codex', '/v1/responses').pathname, '/backend-api/codex/responses');
+  assert.equal(makeTargetUrl('https://chatgpt.com/backend-api/codex', '/v1/models?client_version=0.160.0').href, 'https://chatgpt.com/backend-api/codex/models?client_version=0.160.0');
+  assert.equal(makeTargetUrl('https://api.openai.com/v1', '/v1/responses').pathname, '/v1/responses');
+});
+
+test('GET /v1/models is a transparent daemon probe', async (t) => {
+  const dataDir = await tempDir();
+  let upstreamAuth;
+  const upstream = http.createServer((request, response) => {
+    upstreamAuth = request.headers.authorization;
+    assert.equal(request.method, 'GET');
+    assert.equal(request.url, '/v1/models?limit=1');
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ data: [{ id: 'gpt-5.6' }] }));
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => upstream.close());
+  const proxy = await listenProxy({
+    upstream: `http://127.0.0.1:${upstream.address().port}/v1`,
+    port: 0,
+    dataDir
+  });
+  t.after(() => proxy.close());
+
+  const response = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/models?limit=1`, {
+    headers: { authorization: 'Bearer daemon-login-token' }
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { data: [{ id: 'gpt-5.6' }] });
+  assert.equal(upstreamAuth, 'Bearer daemon-login-token');
+  assert.equal(response.headers.get('x-agent-data-session-id'), null);
+  assert.equal(proxy.agentData.stats.requests, 0);
+  assert.deepEqual(await listFilesRecursive(path.join(dataDir, 'sessions'), '.json'), []);
+  assert.deepEqual(await listFilesRecursive(path.join(dataDir, 'raw'), '.jsonl'), []);
+});
+
+test('daemon probe leaves upstream scope errors intact and does not create sessions', async (t) => {
+  const dataDir = await tempDir();
+  const payload = '{"error":{"message":"Missing scopes: api.model.read"}}';
+  const upstream = http.createServer((request, response) => {
+    assert.equal(request.headers.authorization, 'Bearer login-without-api-scopes');
+    response.writeHead(403, { 'content-type': 'application/json', 'x-request-id': 'scope-probe' });
+    response.end(payload);
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => upstream.close());
+  const proxy = await listenProxy({ upstream: `http://127.0.0.1:${upstream.address().port}/v1`, port: 0, dataDir });
+  t.after(() => proxy.close());
+  const response = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/models`, {
+    headers: { authorization: 'Bearer login-without-api-scopes' }
+  });
+  assert.equal(response.status, 403);
+  assert.equal(response.headers.get('x-request-id'), 'scope-probe');
+  assert.equal(await response.text(), payload);
+  assert.deepEqual(await listFilesRecursive(path.join(dataDir, 'raw'), '.jsonl'), []);
+});
 
 test('proxy forwards request and SSE chunks while recording sanitized raw data', async (t) => {
   const dataDir = await tempDir();
@@ -86,6 +158,95 @@ test('proxy forwards request and SSE chunks while recording sanitized raw data',
   assert.ok(!rawText.includes('super-secret-test-token'));
   assert.ok(!rawText.includes('sk-test-key-1234567890'));
   assert.ok(rawText.includes('[REDACTED]'));
+});
+
+test('Responses-to-Chat bridge rewrites path, body, and streamed response', async (t) => {
+  const dataDir = await tempDir();
+  let seenBody;
+  let seenAuth;
+  const upstream = http.createServer((request, response) => {
+    assert.equal(request.url, '/v1/chat/completions');
+    seenAuth = request.headers.authorization;
+    const chunks = [];
+    request.on('data', (chunk) => chunks.push(chunk));
+    request.on('end', () => {
+      seenBody = JSON.parse(Buffer.concat(chunks));
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end([
+        'data: {"id":"chat-1","model":"relay","choices":[{"delta":{"role":"assistant","content":"hello"},"index":0}]}' + '\n\n',
+        'data: {"id":"chat-1","choices":[{"delta":{"content":" relay"},"finish_reason":"stop","index":0}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}' + '\n\n',
+        'data: [DONE]\n\n'
+      ].join(''));
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => upstream.close());
+  const proxy = await listenProxy({
+    upstream: `http://127.0.0.1:${upstream.address().port}/v1`,
+    port: 0, dataDir, defaultSessionId: 'bridge-session', protocolBridge: 'responses-to-chat'
+  });
+  t.after(() => proxy.close());
+  const response = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/responses`, {
+    method: 'POST', headers: { authorization: 'Bearer relay-token', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'relay', stream: true, input: 'hello' })
+  });
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.equal(seenAuth, 'Bearer relay-token');
+  assert.equal(seenBody.messages[0].content, 'hello');
+  assert.match(text, /response\.output_text\.delta/);
+  assert.match(text, /hello relay/);
+  const sessionFile = path.join(dataDir, 'sessions', 'bridge-session.json');
+  const session = JSON.parse(await waitFor(sessionFile));
+  assert.match(session.turns[0].response.text, /hello relay/);
+});
+
+test('proxy records safety findings while forwarding dangerous requests', async (t) => {
+  const dataDir = await tempDir();
+  const upstream = http.createServer((request, response) => {
+    request.resume();
+    request.on('end', () => {
+      response.writeHead(200, { 'content-type': 'text/event-stream' });
+      response.end('event: response.output_text.delta\\ndata: {"delta":"ack"}\\n\\nevent: response.completed\\ndata: {"status":"completed"}\\n\\n');
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => upstream.close());
+  const proxy = await listenProxy({ upstream: `http://127.0.0.1:${upstream.address().port}/v1`, port: 0, dataDir, defaultSessionId: 'safety-session' });
+  t.after(() => proxy.close());
+  const response = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/responses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'mock', input: 'sudo rm -rf ./tmp' })
+  });
+  await response.text();
+  const session = JSON.parse(await waitFor(path.join(dataDir, 'sessions', 'safety-session.json')));
+  assert.equal(session.safety.risk_level, 'high');
+  assert.ok(session.labels.includes('safety:destructive-filesystem'));
+  assert.ok(session.events.some((event) => event.type === 'safety_finding'));
+  assert.equal(proxy.agentData.stats.safety_findings, 2);
+});
+
+test('Responses-to-Chat bridge falls back to JSON chat responses', async (t) => {
+  const dataDir = await tempDir();
+  const upstream = http.createServer((request, response) => {
+    request.resume();
+    request.on('end', () => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ id: 'chat-json', model: 'relay', choices: [{ message: { role: 'assistant', content: 'json relay' }, finish_reason: 'stop' }], usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } }));
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  t.after(() => upstream.close());
+  const proxy = await listenProxy({ upstream: `http://127.0.0.1:${upstream.address().port}/v1`, port: 0, dataDir, protocolBridge: 'responses-to-chat', defaultSessionId: 'bridge-json' });
+  t.after(() => proxy.close());
+  const response = await fetch(`http://127.0.0.1:${proxy.address().port}/v1/responses`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'relay', stream: true, input: 'hello' })
+  });
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /json relay/);
+  assert.match(text, /response.completed/);
 });
 
 test('proxy turns upstream failures into a recorded error', async (t) => {

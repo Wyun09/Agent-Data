@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Wyun09/Agent-Data/schema/session_schema.json",
+  "title": "Agent Session Data Factory unified session",
+  "type": "object",
+  "required": ["schema_version", "session_id", "agent", "provider", "started_at", "turns", "verification", "reward", "labels", "privacy", "safety", "events"],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "session_id": { "type": "string", "minLength": 1 },
+    "agent": { "type": "object" },
+    "provider": { "type": "object" },
+    "started_at": { "type": ["string", "null"], "format": "date-time" },
+    "ended_at": { "type": ["string", "null"], "format": "date-time" },
+    "environment": { "type": "object" },
+    "turns": { "type": "array", "items": { "type": "object" } },
+    "verification": { "type": "array" },
+    "reward": { "type": "object" },
+    "labels": { "type": "array", "items": { "type": "string" } },
+    "safety": { "type": "object" },
+    "privacy": { "type": "object" },
+    "metadata": { "type": "object" },
+    "events": { "type": "array", "items": { "type": "object", "required": ["type", "timestamp"] } }
+  },
+  "additionalProperties": true
+}

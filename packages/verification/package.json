@@ -1,12 +1,12 @@
 {
   "name": "@agent-data/verification",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "main": "index.js",
   "type": "commonjs",
   "dependencies": {
-    "@agent-data/environment": "0.2.0",
-    "@agent-data/redaction": "0.1.0",
-    "@agent-data/storage": "0.1.0"
+    "@agent-data/environment": "0.3.0",
+    "@agent-data/redaction": "0.3.0",
+    "@agent-data/storage": "0.3.0"
   }
 }

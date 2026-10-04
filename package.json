@@ -1,6 +1,6 @@
 {
   "name": "agent-session-data-factory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local-first raw session recorder and transparent streaming proxy for AI agents.",
   "private": true,
   "type": "commonjs",

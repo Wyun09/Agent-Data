@@ -226,6 +226,12 @@ function normalizeRawRecords(records, options = {}) {
       case 'reward_signal':
         events = [createCanonicalEvent('reward_signal', { reward: record.payload || {} }, record.recorded_at)];
         break;
+      case 'safety_finding':
+        events = [createCanonicalEvent('safety_finding', { finding: record.payload || {} }, record.recorded_at)];
+        break;
+      case 'label':
+        events = [createCanonicalEvent('label', { label: record.payload?.label || record.payload, source: record.payload?.source }, record.recorded_at)];
+        break;
       case 'session_end':
         events = [createCanonicalEvent('session_end', record.payload || {}, record.recorded_at)];
         break;

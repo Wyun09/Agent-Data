@@ -10,9 +10,12 @@ const { reprocessRaw } = require('@agent-data/recorder');
 const { normalizeRawRecords } = require('@agent-data/protocol-openai');
 const { captureEnvironment } = require('@agent-data/environment');
 const { executeVerification, saveContext, saveVerification } = require('@agent-data/verification');
-const { computeReward } = require('@agent-data/rewards');
+const { computeReward, labelsFromVerification } = require('@agent-data/rewards');
 const { selectSessions } = require('@agent-data/filters');
 const { exportDataset, loadSessions } = require('@agent-data/exporters');
+const { inspectCodexDaemon, resetCodexDaemon } = require('@agent-data/codex-daemon');
+const { syncSessionToCodex, resolveResumeThread } = require('@agent-data/codex-session');
+const { readRollout, writeRollout } = require('@agent-data/session-schema');
 const {
   resolveDataDir,
   ensureDataDirs,
@@ -20,10 +23,15 @@ const {
   readJson,
   writeJson,
   sessionPath,
+  findRawFile,
   appendRawRecord
 } = require('@agent-data/storage');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
+
+function defaultUpstream(authMode = 'codex-login') {
+  return authMode === 'api-key' ? 'https://api.openai.com/v1' : 'https://chatgpt.com/backend-api/codex';
+}
 
 function parseArgs(argv) {
   const positional = [];
@@ -47,7 +55,7 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  process.stdout.write(`Agent Session Data Factory ${VERSION}\n\nUsage:\n  agent-data proxy --upstream <url> [options]\n  agent-data start --upstream <url> [options]\n  agent-data run [options] -- <agent command> [args...]\n  agent-data verify [options] -- <command> [args...]\n  agent-data sessions [--data-dir <dir>]\n  agent-data show <session-id> [--data-dir <dir>]\n  agent-data reprocess [--all|--session <id>] [--data-dir <dir>]\n  agent-data filter [--data-dir <dir>]\n  agent-data export sft|rl [options]\n  agent-data doctor [--data-dir <dir>]\n  agent-data config [--data-dir <dir>]\n  agent-data mock-upstream [--port <port>]\n  agent-data version\n\nProxy options:\n  --upstream URL       Upstream API origin (required)\n  --port PORT          Listen port (default 8787)\n  --host HOST          Listen host (default 127.0.0.1)\n  --data-dir DIR       Data directory (default ~/.agent-data)\n  --privacy-mode MODE  safe, strict, or off (default safe)\n  --provider NAME      Protocol adapter (default openai-responses)\n  --auto-export        continuously write aggregate SFT/RL datasets\n  --dashboard          show live request/session counters\n\nRun options:\n  --upstream URL       Upstream API origin (default https://api.openai.com/v1)\n  --auth-mode MODE     codex-login (default) or api-key\n  --session-id ID      Correlate all requests from the child process\n\nExport options:\n  --output FILE        JSONL destination (default data-dir/datasets)\n  --session ID         Export one session\n  --include-failed     Keep sessions with failed verification\n  --include-trivial    Keep short/no-tool trajectories\n`);
+  process.stdout.write(`Agent Session Data Factory ${VERSION}\n\nUsage:\n  agent-data proxy [options]\n  agent-data start [options]\n  agent-data run [options] -- <agent command> [args...]\n  agent-data verify [options] -- <command> [args...]\n  agent-data sessions [--data-dir <dir>]\n  agent-data show <session-id> [--data-dir <dir>]\n  agent-data reprocess [--all|--session <id>] [--data-dir <dir>]\n  agent-data filter [--data-dir <dir>]\n  agent-data export sft|rl [options]\n  agent-data reset-daemon [--codex-home <dir>]\n  agent-data codex-sync [--data-dir <dir>]\n  agent-data resume <session-id> [--inspect]\n  agent-data export-rollout <session-id> [--output <file>]\n  agent-data import-rollout <file> [--data-dir <dir>]\n  agent-data schema\n  agent-data doctor [--data-dir <dir>]\n  agent-data config [--data-dir <dir>]\n  agent-data mock-upstream [--port <port>]\n  agent-data version\n\nProxy options:\n  --upstream URL       ChatGPT Codex backend or OpenAI-compatible origin\n  --port PORT          Listen port (default 8787)\n  --host HOST          Listen host (default 127.0.0.1)\n  --data-dir DIR       Data directory (default ~/.agent-data)\n  --privacy-mode MODE  safe, strict, or off (default safe)\n  --provider NAME      Protocol adapter (default openai-responses)\n  --protocol-bridge MODE  off (default) or responses-to-chat\n  --codex-home DIR     Codex home used for rollout/index sync\n  --auto-export        continuously write aggregate SFT/RL datasets\n  --dashboard          show live request/session counters\n\nRun options:\n  --auth-mode MODE     codex-login (default) or api-key\n  --session-id ID      Correlate all requests from the child process\n  --protocol-bridge MODE  off (default) or responses-to-chat\n\nEnvironment:\n  AGENT_DATA_UPSTREAM, AGENT_DATA_DIR, AGENT_DATA_AUTH_MODE, AGENT_DATA_PROTOCOL_BRIDGE\n`);
 }
 
 function enabledOption(value) {
@@ -77,7 +85,7 @@ async function autoExportSession(dataDir, privacyMode) {
 }
 
 async function commandProxy(options) {
-  if (!options.upstream) throw new Error('--upstream is required for proxy');
+  options = { ...options, upstream: options.upstream || process.env.AGENT_DATA_UPSTREAM || defaultUpstream(options.auth_mode || process.env.AGENT_DATA_AUTH_MODE) };
   const host = options.host || '127.0.0.1';
   const dataDir = resolveDataDir(options.data_dir);
   const privacyMode = options.privacy_mode || 'safe';
@@ -91,14 +99,20 @@ async function commandProxy(options) {
     defaultSessionId: options.default_session_id || (autoExport ? crypto.randomUUID() : undefined),
     privacyMode,
     provider: options.provider || 'openai-responses',
+    protocolBridge: options.protocol_bridge || process.env.AGENT_DATA_PROTOCOL_BRIDGE || 'off',
     normalizer: normalizeRawRecords,
     timeoutMs: options.timeout_ms ? Number(options.timeout_ms) : 0,
-    onSessionFinalized: autoExport
-      ? (finalized) => {
-        autoExportTail = autoExportTail.then(() => autoExportSession(dataDir, privacyMode));
+    onSessionFinalized: (finalized) => {
+        autoExportTail = autoExportTail.catch(() => {}).then(async () => {
+          if (options.codex_index_sync !== 'false') {
+            await syncSessionToCodex(finalized.session, {
+              codexHome: options.codex_home, rawFile: finalized.file, privacyMode
+            }).catch((error) => process.emitWarning('agent-data Codex index: ' + error.message));
+          }
+          if (autoExport) await autoExportSession(dataDir, privacyMode);
+        });
         return autoExportTail;
       }
-      : undefined
   });
   const address = server.address();
   process.stdout.write(`agent-data proxy listening on http://${host}:${address.port}; upstream ${options.upstream}\n`);
@@ -221,13 +235,21 @@ async function commandRun(options) {
     agent: { name: path.basename(command[0]), version: environment.agent?.version, executable: environment.agent?.executable },
     metadata: { launcher: 'agent-data run' }
   });
-  const upstream = options.upstream || process.env.AGENT_DATA_UPSTREAM || 'https://api.openai.com/v1';
+  const upstream = options.upstream || process.env.AGENT_DATA_UPSTREAM || defaultUpstream(authMode);
   const host = options.host || '127.0.0.1';
   const server = await listenProxy({
     upstream, host, dataDir, defaultSessionId: sessionId,
     port: options.port === undefined ? 0 : Number(options.port),
     privacyMode: options.privacy_mode || 'safe',
-    normalizer: normalizeRawRecords
+    normalizer: normalizeRawRecords,
+    onSessionFinalized: async (finalized) => {
+      if (options.codex_index_sync !== 'false') {
+        await syncSessionToCodex(finalized.session, {
+          codexHome: options.codex_home, rawFile: finalized.file, privacyMode: options.privacy_mode || 'safe'
+        }).catch((error) => process.emitWarning('agent-data Codex index: ' + error.message));
+      }
+    },
+    protocolBridge: options.protocol_bridge || process.env.AGENT_DATA_PROTOCOL_BRIDGE || 'off'
   });
   const baseUrl = 'http://' + host + ':' + server.address().port + '/v1';
   const childEnv = { ...process.env, AGENT_DATA_HOME: dataDir, AGENT_DATA_SESSION_ID: sessionId, AGENT_DATA_PROXY_URL: baseUrl };
@@ -257,6 +279,9 @@ async function commandVerify(options) {
     privacyMode: options.privacy_mode || 'safe'
   });
   const saved = await saveVerification({ dataDir, sessionId, result, privacyMode: options.privacy_mode });
+  for (const label of labelsFromVerification(result)) {
+    await appendRawRecord(saved.rawFile, sessionId, 'label', { label, source: 'verification', verification_id: result.verification_id }, { privacyMode: options.privacy_mode });
+  }
   await reprocessRaw({ dataDir, sessionId });
   const session = await readJson(sessionPath(dataDir, sessionId));
   const reward = computeReward(session);
@@ -303,6 +328,69 @@ async function commandDoctor(options) {
   }
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   if (!report.data_dir_writable) process.exitCode = 1;
+}
+
+async function commandResetDaemon(options) {
+  const report = options.inspect ? await inspectCodexDaemon({ codexHome: options.codex_home }) :
+    await resetCodexDaemon({ codexHome: options.codex_home, force: enabledOption(options.force) });
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  return report;
+}
+
+async function commandCodexSync(options) {
+  const dataDir = resolveDataDir(options.data_dir);
+  const sessions = await loadSessions(dataDir, options.session);
+  const results = [];
+  for (const session of sessions) {
+    const rawFile = await findRawFile(dataDir, session.session_id);
+    results.push(await syncSessionToCodex(session, { codexHome: options.codex_home, rawFile }));
+  }
+  process.stdout.write(JSON.stringify(results, null, 2) + '\n');
+  return results;
+}
+
+async function commandResume(sessionId, options) {
+  const id = sessionId || options.session;
+  if (!id) throw new Error('resume requires a captured session id');
+  const dataDir = resolveDataDir(options.data_dir);
+  const session = await readJson(sessionPath(dataDir, id));
+  const native = await resolveResumeThread(session, {
+    codexHome: options.codex_home, rawFile: await findRawFile(dataDir, id)
+  });
+  if (options.inspect) {
+    process.stdout.write(JSON.stringify(native, null, 2) + '\n');
+    return native;
+  }
+  const result = await spawnAttached('codex', ['resume', native.thread_id], {
+    env: { ...process.env, ...(options.codex_home ? { CODEX_HOME: path.resolve(options.codex_home) } : {}) }
+  });
+  process.exitCode = result.code;
+  return result;
+}
+
+async function commandExportRollout(sessionId, options) {
+  if (!sessionId) throw new Error('export-rollout requires a session id');
+  const dataDir = resolveDataDir(options.data_dir);
+  const session = await readJson(sessionPath(dataDir, sessionId));
+  const output = options.output || path.join(dataDir, 'datasets', 'rollouts', `rollout-${sessionId}.jsonl`);
+  const result = await writeRollout(output, session);
+  process.stdout.write(JSON.stringify({ output: result.output, records: result.records.length, session_id: sessionId }, null, 2) + '\n');
+  return result;
+}
+
+async function commandImportRollout(file, options) {
+  if (!file) throw new Error('import-rollout requires a JSONL file');
+  const session = await readRollout(path.resolve(file));
+  const dataDir = await ensureDataDirs(options.data_dir);
+  await writeJson(sessionPath(dataDir, session.session_id), session);
+  process.stdout.write(JSON.stringify({ session_id: session.session_id, destination: sessionPath(dataDir, session.session_id) }, null, 2) + '\n');
+  return session;
+}
+
+async function commandSchema() {
+  const schema = await readJson(path.resolve(__dirname, '../../session_schema.json'));
+  process.stdout.write(JSON.stringify(schema, null, 2) + '\n');
+  return schema;
 }
 
 async function commandConfig(options) {
@@ -375,6 +463,12 @@ async function main(argv = process.argv.slice(2)) {
     case 'show': return commandShow(positional[1], options);
     case 'reprocess': return commandReprocess(options);
     case 'doctor': return commandDoctor(options);
+    case 'reset-daemon': return commandResetDaemon(options);
+    case 'codex-sync': return commandCodexSync(options);
+    case 'resume': return commandResume(positional[1], options);
+    case 'export-rollout': return commandExportRollout(positional[1], options);
+    case 'import-rollout': return commandImportRollout(positional[1], options);
+    case 'schema': return commandSchema();
     case 'config': return commandConfig(options);
     case 'mock-upstream': return commandMockUpstream(options);
     case 'version': return process.stdout.write(`${VERSION}\n`);
@@ -387,4 +481,4 @@ async function main(argv = process.argv.slice(2)) {
   }
 }
 
-module.exports = { main, parseArgs, commandMockUpstream, commandRun, commandVerify, codexProviderArgs, isCodexExecutable };
+module.exports = { main, parseArgs, commandMockUpstream, commandRun, commandVerify, codexProviderArgs, isCodexExecutable, defaultUpstream };

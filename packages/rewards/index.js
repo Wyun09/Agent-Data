@@ -53,8 +53,27 @@ function computeReward(session) {
   return {
     value: totalWeight ? Number((weighted / totalWeight).toFixed(6)) : 0,
     signals: combined,
+    labels: automaticLabels(session),
     computed_at: new Date().toISOString()
   };
+}
+
+function labelsFromVerification(result = {}) {
+  const labels = [];
+  const kind = String(result.kind || 'command');
+  const name = kind === 'tests' ? 'tests' : kind === 'build' ? 'build' : 'verification';
+  labels.push(`verification:${name}:${result.success ? 'passed' : 'failed'}`);
+  if (result.success) labels.push('verification:passed');
+  else if (result.timed_out) labels.push('verification:timed_out');
+  else labels.push('verification:failed');
+  return labels;
+}
+
+function automaticLabels(session) {
+  const labels = new Set(session?.labels || []);
+  for (const result of session?.verification || []) for (const label of labelsFromVerification(result)) labels.add(label);
+  if (session?.safety?.risk_level && session.safety.risk_level !== 'none') labels.add(`safety:risk:${session.safety.risk_level}`);
+  return [...labels];
 }
 
 function attachReward(session) {
@@ -63,4 +82,4 @@ function attachReward(session) {
   return reward;
 }
 
-module.exports = { verificationSignals, trajectorySignals, computeReward, attachReward };
+module.exports = { verificationSignals, trajectorySignals, computeReward, attachReward, labelsFromVerification, automaticLabels };

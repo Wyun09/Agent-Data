@@ -4,7 +4,13 @@ set -euo pipefail
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 CLI="$ROOT_DIR/packages/cli/bin/agent-data.js"
 DATA_DIR=${AGENT_DATA_DIR:-"$ROOT_DIR/.agent-data"}
-UPSTREAM=${AGENT_DATA_UPSTREAM:-"https://api.openai.com/v1"}
+AUTH_MODE=${AGENT_DATA_AUTH_MODE:-codex-login}
+if test "$AUTH_MODE" = 'api-key'; then
+  DEFAULT_UPSTREAM='https://api.openai.com/v1'
+else
+  DEFAULT_UPSTREAM='https://chatgpt.com/backend-api/codex'
+fi
+UPSTREAM=${AGENT_DATA_UPSTREAM:-$DEFAULT_UPSTREAM}
 HOST=${AGENT_DATA_HOST:-127.0.0.1}
 PORT=${AGENT_DATA_PORT:-8787}
 PID_FILE="$DATA_DIR/proxy.pid"
@@ -20,16 +26,23 @@ Usage:
   bash agent-data.sh logs       Follow proxy logs
   bash agent-data.sh ui         Start the live proxy dashboard
   bash agent-data.sh setup-codex Point Codex at the local proxy (one time)
+  bash agent-data.sh reset-daemon Clean a stale Codex app-server socket
+  bash agent-data.sh sync       Sync native Codex rollout indexes
+  bash agent-data.sh resume ID  Resume a captured native Codex thread
+  bash agent-data.sh export-rollout ID Export a unified session as Codex JSONL
+  bash agent-data.sh import-rollout FILE Import Codex JSONL into canonical sessions
   bash agent-data.sh codex ...  Record a Codex login session
   bash agent-data.sh task "..."  Run, verify, filter, and export in one step
   bash agent-data.sh demo       Run a local mock end-to-end request
 
 Environment overrides:
-  AGENT_DATA_UPSTREAM   Upstream URL (default: https://api.openai.com/v1)
+  AGENT_DATA_UPSTREAM   Upstream URL (default: ChatGPT Codex login backend)
   AGENT_DATA_PORT       Proxy port (default: 8787)
   AGENT_DATA_HOST       Proxy host (default: 127.0.0.1)
   AGENT_DATA_DIR        Data directory (default: ./.agent-data)
   AGENT_DATA_AUTH_MODE  codex-login (default) or api-key
+  AGENT_DATA_PROTOCOL_BRIDGE off (default) or responses-to-chat
+  AGENT_DATA_RESET_DAEMON 1 (default), set 0 to skip stale socket cleanup
   AGENT_DATA_AUTO_VERIFY auto (default), 0 to skip, or a custom command below
   AGENT_DATA_VERIFY_COMMAND  Verification command, for example: npm test
 HELP
@@ -45,6 +58,9 @@ pid_is_running() {
 
 start_proxy() {
   mkdir -p "$DATA_DIR"
+  if test "${AGENT_DATA_RESET_DAEMON:-1}" != '0'; then
+    node "$CLI" reset-daemon --force --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null 2>&1 || true
+  fi
   local current_upstream=${AGENT_DATA_UPSTREAM:-$UPSTREAM}
   local current_host=${AGENT_DATA_HOST:-$HOST}
   local current_port=${AGENT_DATA_PORT:-$PORT}
@@ -164,6 +180,7 @@ run_codex() {
     --port 0 \
     --data-dir "$DATA_DIR" \
     --auth-mode "${AGENT_DATA_AUTH_MODE:-codex-login}" \
+    --protocol-bridge "${AGENT_DATA_PROTOCOL_BRIDGE:-off}" \
     --session-id "$session_id" \
     -- codex "$@"
   then
@@ -217,6 +234,10 @@ setup_codex() {
   test -z "$backup" || printf '%s\n' "Backup: $backup"
 }
 
+reset_daemon() {
+  node "$CLI" reset-daemon --force --codex-home "${CODEX_HOME:-$HOME/.codex}" "$@"
+}
+
 run_demo() {
   local demo_dir demo_pid
   if pid_is_running; then
@@ -265,6 +286,11 @@ case "$command" in
   logs) mkdir -p "$DATA_DIR"; touch "$LOG_FILE"; tail -f "$LOG_FILE" ;;
   ui) run_ui ;;
   setup-codex) setup_codex ;;
+  reset-daemon) reset_daemon "$@" ;;
+  sync) node "$CLI" codex-sync --data-dir "$DATA_DIR" "$@" ;;
+  resume) node "$CLI" resume --data-dir "$DATA_DIR" "$@" ;;
+  export-rollout) node "$CLI" export-rollout --data-dir "$DATA_DIR" "$@" ;;
+  import-rollout) node "$CLI" import-rollout --data-dir "$DATA_DIR" "$@" ;;
   codex) run_codex "$@" ;;
   task) run_task "$@" ;;
   demo) run_demo ;;

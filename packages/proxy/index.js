@@ -6,21 +6,28 @@ const zlib = require('node:zlib');
 const { SSEParser } = require('@agent-data/core/sse');
 const { RawEventRecorder, finalizeRawSession } = require('@agent-data/recorder');
 const { assertId, contextPath, resolveDataDir } = require('@agent-data/storage');
+const { responsesToChat, ChatToResponses, encodeEvent } = require('@agent-data/protocol-openai/chat-bridge');
+const { inspectDangerousCommands } = require('@agent-data/safety');
 
 const HOP_BY_HOP = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade'
 ]);
+const END_TO_END_AUTH_HEADER = 'authorization';
 
 function copyForwardHeaders(headers, target) {
   const result = {};
   const excluded = String(headers.connection || '').toLowerCase().split(',').map((name) => name.trim());
   for (const [name, value] of Object.entries(headers || {})) {
     const lower = name.toLowerCase();
-    if (HOP_BY_HOP.has(lower) || excluded.includes(lower) ||
+    if (HOP_BY_HOP.has(lower) || (excluded.includes(lower) && lower !== END_TO_END_AUTH_HEADER) ||
         ['host', 'content-length', 'x-agent-data-session-id'].includes(lower)) continue;
     result[name] = value;
   }
+  // Authorization is an end-to-end header. Keep it even when a malformed
+  // client Connection header incorrectly lists it as hop-by-hop.
+  const authorization = headers.authorization ?? headers.Authorization;
+  if (authorization !== undefined) result.authorization = authorization;
   result.host = target.host;
   return result;
 }
@@ -37,11 +44,36 @@ function makeTargetUrl(upstream, incomingUrl) {
   const base = new URL(upstream);
   const request = new URL(incomingUrl || '/', 'http://agent-data.invalid');
   const prefix = base.pathname.replace(/\/$/, '');
+  // The ChatGPT login backend is not the API-key /v1 endpoint. Codex still
+  // talks to our local /v1 provider, so remove that local prefix upstream.
+  if (prefix.endsWith('/backend-api/codex') && request.pathname.startsWith('/v1/')) {
+    request.pathname = request.pathname.slice(3);
+  }
   if (!prefix || prefix === '/' || request.pathname === prefix || request.pathname.startsWith(prefix + '/')) {
     base.pathname = request.pathname;
   } else base.pathname = prefix + '/' + request.pathname.replace(/^\/+/, '');
   base.search = request.search;
   return base;
+}
+
+function isModelsProbe(method, incomingUrl) {
+  if (String(method || '').toUpperCase() !== 'GET') return false;
+  try {
+    const pathname = new URL(incomingUrl || '/', 'http://agent-data.invalid').pathname.replace(/\/+$/, '') || '/';
+    return pathname === '/v1/models' || pathname.endsWith('/v1/models');
+  } catch {
+    return false;
+  }
+}
+
+function isResponsesToChatBridge(method, incomingUrl, mode) {
+  if (mode !== 'responses-to-chat' || String(method || '').toUpperCase() !== 'POST') return false;
+  try {
+    const pathname = new URL(incomingUrl || '/', 'http://agent-data.invalid').pathname.replace(/\/+$/, '');
+    return pathname === '/v1/responses' || pathname.endsWith('/v1/responses');
+  } catch {
+    return false;
+  }
 }
 
 function responseHeaders(headers) {
@@ -54,6 +86,36 @@ function readSessionContext(dataDir, sessionId) {
   try { return JSON.parse(fs.readFileSync(contextPath(dataDir, sessionId), 'utf8')); } catch { return null; }
 }
 
+function passthroughRequest(clientRequest, clientResponse, options, transport) {
+  const target = makeTargetUrl(options.upstream, clientRequest.url);
+  const upstreamRequest = transport.request({
+    hostname: target.hostname,
+    port: target.port || (target.protocol === 'https:' ? 443 : 80),
+    path: target.pathname + target.search,
+    method: clientRequest.method,
+    headers: copyForwardHeaders(clientRequest.headers, target),
+    rejectUnauthorized: options.rejectUnauthorized
+  }, (upstreamResponse) => {
+    clientResponse.writeHead(upstreamResponse.statusCode || 502, responseHeaders(upstreamResponse.headers));
+    upstreamResponse.pipe(clientResponse);
+    upstreamResponse.on('aborted', () => clientResponse.destroy());
+    upstreamResponse.on('error', () => clientResponse.destroy());
+  });
+  if (options.timeoutMs) upstreamRequest.setTimeout(options.timeoutMs, () =>
+    upstreamRequest.destroy(Object.assign(new Error('upstream timeout'), { code: 'ETIMEDOUT' })));
+  upstreamRequest.on('error', (error) => {
+    if (clientResponse.destroyed) return;
+    if (!clientResponse.headersSent) {
+      clientResponse.writeHead(502, { 'content-type': 'application/json' });
+      clientResponse.end(JSON.stringify({ error: 'upstream_error', message: error.message }));
+    } else clientResponse.end();
+  });
+  clientRequest.on('aborted', () => upstreamRequest.destroy());
+  clientRequest.on('error', () => upstreamRequest.destroy());
+  clientRequest.pipe(upstreamRequest);
+  return upstreamRequest;
+}
+
 function createProxyServer(options = {}) {
   if (!options.upstream) throw new TypeError('upstream is required');
   const upstream = new URL(options.upstream);
@@ -62,6 +124,7 @@ function createProxyServer(options = {}) {
   const dataDir = resolveDataDir(options.dataDir);
   const privacyMode = options.privacyMode || 'safe';
   const provider = options.provider || 'openai-responses';
+  const protocolBridge = options.protocolBridge || options.protocol_bridge || 'off';
   const states = new Map();
   const pending = new Set();
   const maxCapture = options.maxCaptureBytes || 8 * 1024 * 1024;
@@ -71,13 +134,23 @@ function createProxyServer(options = {}) {
     responses: 0,
     sessions: 0,
     captured_events: 0,
+    safety_findings: 0,
     last_activity: null
   };
 
   const server = http.createServer((clientRequest, clientResponse) => {
+    // Codex's daemon calls GET /v1/models before it has a conversation. Keep
+    // this capability probe completely transparent: it must retain the
+    // login Authorization header and must not create a training session.
+    if (isModelsProbe(clientRequest.method, clientRequest.url)) {
+      passthroughRequest(clientRequest, clientResponse, options, transport);
+      return;
+    }
     let sessionId;
     try {
-      sessionId = assertId(String(clientRequest.headers['x-agent-data-session-id'] || options.defaultSessionId || crypto.randomUUID()), 'session id');
+      sessionId = assertId(String(clientRequest.headers['x-agent-data-session-id'] ||
+        clientRequest.headers['thread-id'] || clientRequest.headers['session-id'] ||
+        clientRequest.headers['x-codex-thread-id'] || options.defaultSessionId || crypto.randomUUID()), 'session id');
     } catch {
       clientResponse.writeHead(400, { 'content-type': 'application/json' });
       clientResponse.end(JSON.stringify({ error: 'invalid_session_id' }));
@@ -141,21 +214,45 @@ function createProxyServer(options = {}) {
     clientRequest.on('error', cancel);
     clientResponse.on('close', () => { if (!responseEnded) cancel(); });
 
+    const bridgeRequest = isResponsesToChatBridge(clientRequest.method, clientRequest.url, protocolBridge);
+    const bridgeState = { request: null, customTools: new Set(), response_body: [] };
     const target = makeTargetUrl(options.upstream, clientRequest.url);
+    if (bridgeRequest) target.pathname = target.pathname.replace(/\/responses(?=\?|$)/, '/chat/completions');
+    const forwardHeaders = copyForwardHeaders(clientRequest.headers, target);
+    if (bridgeRequest) {
+      forwardHeaders['accept-encoding'] = 'identity';
+      forwardHeaders['content-type'] = 'application/json';
+    }
     upstreamRequest = transport.request({
       hostname: target.hostname,
       port: target.port || (target.protocol === 'https:' ? 443 : 80),
       path: target.pathname + target.search, method: clientRequest.method,
-      headers: copyForwardHeaders(clientRequest.headers, target),
+      headers: forwardHeaders,
       rejectUnauthorized: options.rejectUnauthorized
     }, (upstreamResponse) => {
       const contentType = String(upstreamResponse.headers['content-type'] || '');
       const encoding = String(upstreamResponse.headers['content-encoding'] || '').toLowerCase();
       const statusCode = upstreamResponse.statusCode || 502;
-      clientResponse.writeHead(statusCode, { ...responseHeaders(upstreamResponse.headers), 'x-agent-data-session-id': sessionId });
+      const bridgeResponse = bridgeRequest && statusCode < 400;
+      const bridgeStreaming = bridgeResponse && contentType.includes('text/event-stream');
+      const outgoingContentType = bridgeResponse
+        ? (bridgeState.request?.stream === false ? 'application/json' : 'text/event-stream')
+        : contentType;
+      const outgoingHeaders = { ...responseHeaders(upstreamResponse.headers), 'x-agent-data-session-id': sessionId };
+      if (bridgeResponse) {
+        delete outgoingHeaders['content-length'];
+        delete outgoingHeaders['content-encoding'];
+        delete outgoingHeaders.etag;
+        outgoingHeaders['content-type'] = outgoingContentType;
+      }
+      clientResponse.writeHead(statusCode, outgoingHeaders);
       clientResponse.flushHeaders();
       void record('response_start', { status_code: statusCode, headers: upstreamResponse.headers, content_type: contentType });
-      const parser = contentType.includes('text/event-stream') ? new (options.sseParser || SSEParser)() : null;
+      const parser = outgoingContentType.includes('text/event-stream') ? new (options.sseParser || SSEParser)() : null;
+      const bridgeParser = bridgeResponse && contentType.includes('text/event-stream') ? new SSEParser() : null;
+      const bridgeAdapter = bridgeResponse ? new ChatToResponses(bridgeState.request || {}, bridgeState.customTools) : null;
+      let bridgeDone = false;
+      let bridgeResponseBytes = 0;
       let captured = 0;
       let body = [];
       let decoder;
@@ -192,6 +289,48 @@ function createProxyServer(options = {}) {
           content_type: contentType
         });
       };
+      const emitLogicalChunk = (chunk) => {
+        if (!clientClosed && !clientResponse.write(chunk)) upstreamResponse.pause();
+        decodedData(chunk);
+      };
+      const bridgeSseEvent = (event) => {
+        if (event.data === '[DONE]') {
+          bridgeDone = true;
+          return;
+        }
+        try {
+          const payload = JSON.parse(event.data || '{}');
+          for (const output of bridgeAdapter.consume(payload)) emitLogicalChunk(Buffer.from(encodeEvent(output)));
+        } catch (error) {
+          for (const output of bridgeAdapter.fail({ code: 'invalid_chat_json', message: error.message })) {
+            emitLogicalChunk(Buffer.from(encodeEvent(output)));
+          }
+        }
+      };
+      const bridgeChunk = (chunk) => {
+        if (bridgeStreaming) {
+          for (const event of bridgeParser.feed(chunk)) bridgeSseEvent(event);
+          return;
+        }
+        bridgeResponseBytes += chunk.length;
+        if (bridgeResponseBytes <= maxCapture) bridgeState.response_body.push(Buffer.from(chunk));
+        else recorder.incomplete = true;
+      };
+      const bridgeEnd = () => {
+        if (!bridgeResponse) return;
+        if (bridgeStreaming) {
+          for (const event of bridgeParser.finish()) bridgeSseEvent(event);
+          for (const output of bridgeAdapter.finish(bridgeDone)) emitLogicalChunk(Buffer.from(encodeEvent(output)));
+          return;
+        }
+        const chatResponse = JSON.parse(Buffer.concat(bridgeState.response_body).toString('utf8'));
+        const outputs = bridgeAdapter.consume(chatResponse).concat(bridgeAdapter.finish(true));
+        if (bridgeState.request?.stream === false) {
+          emitLogicalChunk(Buffer.from(JSON.stringify(bridgeAdapter.response())));
+        } else {
+          for (const output of outputs) emitLogicalChunk(Buffer.from(encodeEvent(output)));
+        }
+      };
       if (encoding === 'gzip') decoder = zlib.createGunzip();
       else if (encoding === 'deflate') decoder = zlib.createInflate();
       else if (encoding === 'br') decoder = zlib.createBrotliDecompress();
@@ -200,8 +339,7 @@ function createProxyServer(options = {}) {
         void record('capture_error', { code: 'unsupported_encoding', encoding });
       }
       if (decoder) {
-        decoder.on('data', decodedData);
-        decoder.on('end', decodedEnd);
+        decoder.on('data', bridgeResponse ? bridgeChunk : decodedData);
         decoder.on('error', (error) => {
           recorder.incomplete = true;
           finish('capture_error', { message: error.message });
@@ -209,18 +347,32 @@ function createProxyServer(options = {}) {
       }
       upstreamResponse.on('data', (chunk) => {
         firstByteAt ||= new Date();
-        if (!clientClosed && !clientResponse.write(chunk)) upstreamResponse.pause();
         if (decoder) decoder.write(chunk);
-        else if (!encoding || encoding === 'identity') decodedData(chunk);
+        else if (!encoding || encoding === 'identity') {
+          if (bridgeResponse) bridgeChunk(chunk);
+          else {
+            if (!clientClosed && !clientResponse.write(chunk)) upstreamResponse.pause();
+            decodedData(chunk);
+          }
+        }
       });
       clientResponse.on('drain', () => upstreamResponse.resume());
-      upstreamResponse.on('end', () => {
+      const finishResponse = () => {
+        try { bridgeEnd(); } catch (error) {
+          recorder.incomplete = true;
+          void record('capture_error', { code: 'bridge_error', message: error.message });
+        }
+        decodedEnd();
         responseEnded = true;
         stats.responses += 1;
         stats.last_activity = new Date().toISOString();
         if (!clientClosed) clientResponse.end();
-        if (decoder) decoder.end();
-        else decodedEnd();
+      };
+      upstreamResponse.on('end', () => {
+        if (decoder) {
+          decoder.once('end', finishResponse);
+          decoder.end();
+        } else finishResponse();
       });
       const failure = (error) => {
         finish('upstream_error', { code: error?.code || 'upstream_response_aborted', message: error?.message });
@@ -249,20 +401,59 @@ function createProxyServer(options = {}) {
       requestBytes += chunk.length;
       if (requestBytes <= maxCapture) requestChunks.push(Buffer.from(chunk));
       else { requestChunks.length = 0; recorder.incomplete = true; }
-      if (!upstreamRequest.destroyed && !upstreamRequest.write(chunk)) clientRequest.pause();
+      if (!bridgeRequest && !upstreamRequest.destroyed && !upstreamRequest.write(chunk)) clientRequest.pause();
     });
     upstreamRequest.on('drain', () => clientRequest.resume());
     clientRequest.on('end', () => {
+      const requestBody = requestBytes <= maxCapture
+        ? requestBodyValue(Buffer.concat(requestChunks), String(clientRequest.headers['content-type'] || ''))
+        : null;
+      let upstreamBody;
+      if (bridgeRequest && requestBody && typeof requestBody === 'object') {
+        try {
+          const converted = responsesToChat(requestBody);
+          bridgeState.request = requestBody;
+          bridgeState.customTools = converted.customTools;
+          upstreamBody = Buffer.from(JSON.stringify(converted.chat));
+        } catch (error) {
+          void record('proxy_error', { code: error.code || 'bridge_request_error', message: error.message });
+          finish('upstream_error', { code: error.code || 'bridge_request_error', message: error.message });
+          if (!clientResponse.headersSent) {
+            clientResponse.writeHead(error.statusCode || 400, { 'content-type': 'application/json', 'x-agent-data-session-id': sessionId });
+            clientResponse.end(JSON.stringify({ error: { code: error.code || 'bridge_request_error', message: error.message } }));
+          }
+          return;
+        }
+      } else if (bridgeRequest) {
+        const error = new Error('Responses-to-Chat bridge requires a JSON request body');
+        error.code = 'bridge_request_body_required';
+        void record('proxy_error', { code: error.code, message: error.message });
+        finish('upstream_error', { code: error.code, message: error.message });
+        if (!clientResponse.headersSent) {
+          clientResponse.writeHead(400, { 'content-type': 'application/json', 'x-agent-data-session-id': sessionId });
+          clientResponse.end(JSON.stringify({ error: { code: error.code, message: error.message } }));
+        }
+        return;
+      }
       void record('request', {
         method: clientRequest.method, url: clientRequest.url, headers: clientRequest.headers,
-        body: requestBytes <= maxCapture ? requestBodyValue(Buffer.concat(requestChunks), String(clientRequest.headers['content-type'] || '')) : null,
-        capture_incomplete: requestBytes > maxCapture, provider
+        body: requestBody,
+        capture_incomplete: requestBytes > maxCapture, provider,
+        ...(bridgeRequest ? { protocol_bridge: 'responses-to-chat' } : {})
       });
-      if (!upstreamRequest.destroyed) upstreamRequest.end();
+      const safety = inspectDangerousCommands(requestBody);
+      if (safety.detected) {
+        stats.safety_findings += safety.findings.length;
+        for (const finding of safety.findings) void record('safety_finding', finding);
+      }
+      if (!upstreamRequest.destroyed) {
+        if (bridgeRequest) upstreamRequest.end(upstreamBody);
+        else upstreamRequest.end();
+      }
     });
   });
   server.agentData = {
-    upstream: options.upstream, dataDir, privacyMode, provider, stats,
+    upstream: options.upstream, dataDir, privacyMode, provider, protocol_bridge: protocolBridge, stats,
     drain: async () => {
       await Promise.all([...pending]);
       await Promise.all([...states.values()].map((state) => state.recorder.flush()));
@@ -283,4 +474,7 @@ async function listenProxy(options = {}) {
   return server;
 }
 
-module.exports = { createProxyServer, listenProxy, makeTargetUrl, copyForwardHeaders, readSessionContext };
+module.exports = {
+  createProxyServer, listenProxy, makeTargetUrl, copyForwardHeaders,
+  isModelsProbe, isResponsesToChatBridge, passthroughRequest, readSessionContext
+};

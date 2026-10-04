@@ -46,3 +46,13 @@ codex
 用 `bash agent-data.sh task "Fix the failing test"` 完成运行、验证和导出。
 
 `PLAN.md` 仍是本地计划文件，不提交到 GitHub。训练项目目录只是被记录为运行环境的 Git 仓库信息，不会自动上传源码、完整 diff、环境变量或凭据。
+
+## 0.3 修复项
+
+- Codex 登录模式默认使用 `chatgpt.com/backend-api/codex`；`Authorization` 不参与
+  采集脱敏前的上游转发。
+- daemon 的 `GET /v1/models` 走透明直通，不创建 session；`reset-daemon` 只清理失活
+  的 socket 和启动锁。
+- 可选 `responses-to-chat` 桥接兼容只支持 Chat Completions 的中转。
+- canonical session 是统一来源，raw、Codex rollout 和 `session_index.jsonl` 都是投影；
+  危险命令、测试/构建结果会写入 safety、labels 和 reward。

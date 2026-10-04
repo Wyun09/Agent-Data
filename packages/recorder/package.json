@@ -1,12 +1,12 @@
 {
   "name": "@agent-data/recorder",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "main": "index.js",
   "type": "commonjs",
   "dependencies": {
-    "@agent-data/core": "0.1.0",
-    "@agent-data/protocol-openai": "0.1.0",
-    "@agent-data/storage": "0.1.0"
+    "@agent-data/core": "0.3.0",
+    "@agent-data/protocol-openai": "0.3.0",
+    "@agent-data/storage": "0.3.0"
   }
 }

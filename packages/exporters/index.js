@@ -40,6 +40,8 @@ function toSftRecord(session, options = {}) {
       model: session.provider?.model || null,
       protocol: session.provider?.protocol || null,
       reward: session.reward || null,
+      labels: session.labels || [],
+      safety: session.safety || { risk_level: 'none', findings: [] },
       verification: session.verification || [],
       environment: options.include_environment === false ? undefined : session.environment || {}
     }
@@ -53,10 +55,13 @@ function toRlRecord(session, options = {}) {
     trajectory: session.events || [],
     reward: session.reward?.value ?? 0,
     reward_signals: session.reward?.signals || {},
+    labels: session.labels || [],
     metadata: {
       model: session.provider?.model || null,
       protocol: session.provider?.protocol || null,
       verification: session.verification || [],
+      labels: session.labels || [],
+      safety: session.safety || { risk_level: 'none', findings: [] },
       environment: options.include_environment === false ? undefined : session.environment || {}
     }
   }, { mode: options.privacyMode || 'safe' });

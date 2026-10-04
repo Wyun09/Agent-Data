@@ -1,6 +1,6 @@
 # Agent Session Data Factory
 
-Agent Session Data Factory v0.2.0 is a local-first recorder and transparent
+Agent Session Data Factory v0.3.0 is a local-first recorder and transparent
 HTTP/SSE proxy for agent sessions. It forwards requests to an upstream API,
 records sanitized raw protocol events as append-only JSONL, and creates a
 provider-independent canonical session that can be reprocessed later.
@@ -77,7 +77,7 @@ bash agent-data.sh demo
 
 ```bash
 node packages/cli/bin/agent-data.js proxy \
-  --upstream https://api.openai.com/v1 \
+  --upstream https://chatgpt.com/backend-api/codex \
   --port 8787
 ```
 
@@ -143,7 +143,21 @@ cookies, API keys, JWTs, private keys, and common cloud credentials are never
 written to disk.
 
 ```bash
-node packages/cli/bin/agent-data.js proxy --upstream https://api.openai.com/v1 --privacy-mode strict
+node packages/cli/bin/agent-data.js proxy --upstream https://chatgpt.com/backend-api/codex --privacy-mode strict
+```
+
+For a Chat Completions-only relay, add
+`--protocol-bridge responses-to-chat`. The proxy converts Responses requests
+and streaming events at the boundary while keeping the canonical session
+format.
+
+Daemon and resume helpers:
+
+```bash
+bash agent-data.sh reset-daemon
+bash agent-data.sh sync
+bash agent-data.sh export-rollout <session-id>
+bash agent-data.sh import-rollout <rollout.jsonl>
 ```
 
 The proxy forwards headers to the upstream as needed for authentication; only
@@ -159,6 +173,10 @@ packages/storage          JSONL and local file storage
 packages/recorder         raw-to-canonical replay
 packages/proxy            HTTP forwarding and SSE passthrough
 packages/protocol-openai  Responses request/SSE adapter
+packages/session-schema   unified session schema and Codex rollout bridge
+packages/codex-session    native rollout/index projection and resume guard
+packages/codex-daemon     stale app-server socket inspection/reset
+packages/safety            non-blocking dangerous command labels
 packages/redaction        disk-boundary secret redaction
 packages/cli              agent-data command line interface
 packages/environment      Git, runtime, and agent environment capture

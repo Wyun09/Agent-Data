@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-10-04
+
+- Preserved Codex login Authorization headers and made `GET /v1/models` a transparent daemon probe.
+- Added ChatGPT Codex login endpoint defaults and an optional Responses-to-Chat Completions bridge.
+- Added stale daemon socket reset, native rollout/index projection, and resume-safe guards.
+- Added the unified `session_schema.json`, Codex rollout import/export, non-blocking safety labels, and automatic verification labels/rewards.
+- Expanded the regression suite to 36 tests and validated the local Codex E2E.
+
 ## 0.2.0 - 2026-10-04
 
 - Added a login-aware `agent-data run` launcher that reuses Codex `codex login` sessions.

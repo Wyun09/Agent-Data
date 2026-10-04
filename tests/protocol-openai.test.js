@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { parseSSE, normalizeSSEEvent, normalizeRequest, normalizeRawRecords } = require('@agent-data/protocol-openai');
+const { responsesToChat, ChatToResponses } = require('@agent-data/protocol-openai/chat-bridge');
 
 const fixture = (name) => fs.readFileSync(path.join(__dirname, '..', 'fixtures', name), 'utf8');
 
@@ -69,4 +70,29 @@ test('raw replay creates a schema v1 session', () => {
   assert.equal(session.provider.protocol, 'openai-responses');
   assert.match(session.turns[0].response.text, /Hello world/);
   assert.equal(session.turns[0].usage.output_tokens, 2);
+});
+
+test('Responses to Chat bridge preserves history and function tools', () => {
+  const result = responsesToChat({
+    model: 'relay-model', instructions: 'Be concise.', stream: true,
+    input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }],
+    tools: [{ type: 'function', name: 'shell', description: 'run a command', parameters: { type: 'object' } }]
+  });
+  assert.equal(result.chat.messages[0].role, 'system');
+  assert.equal(result.chat.messages[1].content[0].text, 'hello');
+  assert.equal(result.chat.tools[0].function.name, 'shell');
+  assert.equal(result.chat.stream_options.include_usage, true);
+});
+
+test('Chat stream bridge emits Responses text and completion events', () => {
+  const adapter = new ChatToResponses({ model: 'relay-model', stream: true });
+  const events = [
+    ...adapter.consume({ id: 'chat-1', model: 'relay-model', choices: [{ delta: { role: 'assistant', content: 'hello' } }] }),
+    ...adapter.consume({ id: 'chat-1', choices: [{ delta: { content: ' world' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 } }),
+    ...adapter.finish(true)
+  ];
+  assert.equal(events[0].type, 'response.created');
+  assert.equal(events.filter((event) => event.type === 'response.output_text.delta').map((event) => event.delta).join(''), 'hello world');
+  assert.equal(events.at(-1).type, 'response.completed');
+  assert.equal(events.at(-1).response.usage.output_tokens, 2);
 });

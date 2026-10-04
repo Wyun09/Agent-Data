@@ -1,5 +1,5 @@
 {
-  "agent_data": "0.2.0",
+  "agent_data": "0.3.0",
   "schema": "1.0",
   "agents": {
     "codex": {"tested": ["0.160.0"]},

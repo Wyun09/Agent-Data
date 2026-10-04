@@ -21,6 +21,7 @@ const CANONICAL_EVENT_TYPES = Object.freeze([
   'verification_result',
   'reward_signal',
   'label',
+  'safety_finding',
   'error',
   'provider_event'
 ]);
@@ -56,6 +57,7 @@ function createSession(options = {}) {
     verification: options.verification || [],
     reward: options.reward || {},
     labels: options.labels || [],
+    safety: options.safety || { risk_level: 'none', findings: [] },
     privacy: {
       mode: options.privacy?.mode || 'safe',
       ...(options.privacy || {})
@@ -191,6 +193,17 @@ function applyCanonicalEvent(session, event) {
       session.labels ||= [];
       if (event.label !== undefined) session.labels.push(event.label);
       break;
+    case 'safety_finding': {
+      session.safety ||= { risk_level: 'none', findings: [] };
+      const finding = event.finding || event;
+      session.safety.findings.push(finding);
+      const rank = { none: 0, low: 1, medium: 2, high: 3, critical: 4 };
+      if ((rank[finding.severity] || 0) > (rank[session.safety.risk_level] || 0)) session.safety.risk_level = finding.severity;
+      session.labels ||= [];
+      const label = finding.rule ? `safety:${finding.rule}` : undefined;
+      if (label && !session.labels.includes(label)) session.labels.push(label);
+      break;
+    }
     default:
       break;
   }
@@ -202,7 +215,7 @@ function validateSession(session) {
   if (!session || typeof session !== 'object') return { valid: false, errors: ['session must be an object'] };
   if (session.schema_version !== SCHEMA_VERSION) errors.push(`schema_version must be ${SCHEMA_VERSION}`);
   if (typeof session.session_id !== 'string' || !session.session_id) errors.push('session_id is required');
-  for (const key of ['agent', 'provider', 'environment', 'turns', 'verification', 'reward', 'labels', 'privacy']) {
+  for (const key of ['agent', 'provider', 'environment', 'turns', 'verification', 'reward', 'labels', 'privacy', 'safety']) {
     if (session[key] === undefined) errors.push(`${key} is required`);
   }
   if (!Array.isArray(session.turns)) errors.push('turns must be an array');
